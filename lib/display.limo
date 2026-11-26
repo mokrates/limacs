@@ -1,0 +1,301 @@
+;; -*- limo -*-
+;; limacs/lib/display.limo --- turning buffer state into screen rows.
+;;
+;; A row is a list of segments (face . text).  The terminal layer turns
+;; segments into ANSI sequences (or, in headless test mode, into plain text).
+
+(setq *esc* (chr 27))
+
+;;; ------------------------------------------------------------------
+;;; themes (face -> SGR parameters).  `M-x load-theme'.
+
+(setq *themes* (make-dict))
+(defun define-theme (name alist) (dput *themes* name alist))
+(defun apply-theme (name)                   ; NAME is a symbol; nil if there is no such theme
+  (let ((th (dget *themes* name)))
+    (when th (for-each p th (define-face (car p) (cdr p))) (set-var 'theme name) :t)))
+(defun theme-names () (sort string< (map1 (lambda (k) (str-downcase (symbol-to-string k))) (dkeys *themes*))))
+
+(define-theme 'dark
+  '((keyword . "1;38;5;75") (type . "38;5;114") (string . "38;5;180") (comment . "3;38;5;244")
+    (number . "38;5;209") (preproc . "38;5;176") (function . "1;38;5;221") (builtin . "38;5;81")
+    (constant . "38;5;209") (variable . "38;5;152") (quote . "38;5;176") (escape . "1;38;5;215")
+    (heading1 . "1;4;38;5;221") (heading2 . "1;38;5;221") (heading3 . "1;38;5;180")
+    (heading4 . "1;38;5;150") (heading5 . "1;38;5;150") (heading6 . "1;38;5;150")
+    (bold . "1") (italic . "3") (bolditalic . "1;3") (strike . "9") (code . "38;5;180;48;5;236")
+    (code-fence . "38;5;244") (link . "4;38;5;75") (url . "38;5;244") (list-marker . "1;38;5;209")
+    (blockquote . "3;38;5;108") (hr . "38;5;244") (table . "38;5;244") (html . "38;5;176")
+    (region . "7") (isearch . "30;48;5;221") (isearch-other . "30;48;5;250")
+    (paren-match . "1;30;48;5;114") (paren-mismatch . "1;37;48;5;160") (trailing-ws . "48;5;131")
+    (mode-line . "7") (mode-line-dim . "7;2") (echo . "") (prompt . "1;38;5;81")
+    (line-number . "38;5;240") (truncation . "38;5;240") (im-pending . "4;38;5;221")
+    (hl-line . "48;5;236") (error . "1;38;5;203") (match-case . "1;38;5;221")))
+
+(define-theme 'light
+  '((keyword . "1;38;5;19") (type . "38;5;28") (string . "38;5;130") (comment . "3;38;5;243")
+    (number . "38;5;166") (preproc . "38;5;90") (function . "1;38;5;94") (builtin . "38;5;24")
+    (constant . "38;5;166") (variable . "38;5;24") (quote . "38;5;90") (escape . "1;38;5;166")
+    (heading1 . "1;4;38;5;94") (heading2 . "1;38;5;94") (heading3 . "1;38;5;130")
+    (heading4 . "1;38;5;28") (heading5 . "1;38;5;28") (heading6 . "1;38;5;28")
+    (bold . "1") (italic . "3") (bolditalic . "1;3") (strike . "9") (code . "38;5;130;48;5;254")
+    (code-fence . "38;5;243") (link . "4;38;5;19") (url . "38;5;243") (list-marker . "1;38;5;166")
+    (blockquote . "3;38;5;28") (hr . "38;5;243") (table . "38;5;243") (html . "38;5;90")
+    (region . "7") (isearch . "48;5;221") (isearch-other . "48;5;250")
+    (paren-match . "1;48;5;151") (paren-mismatch . "1;37;48;5;160") (trailing-ws . "48;5;217")
+    (mode-line . "7") (mode-line-dim . "7;2") (echo . "") (prompt . "1;38;5;24")
+    (line-number . "38;5;250") (truncation . "38;5;250") (im-pending . "4;38;5;166")
+    (hl-line . "48;5;254") (error . "1;38;5;160") (match-case . "1;38;5;94")))
+
+(apply-theme 'dark)
+
+;; M-x load-theme  (or (load-theme 'light) from your init file)
+(defcommand load-theme rest "Switch colour theme (dark, light, or one you defined with define-theme)."
+  (let* ((arg (if rest (car rest) ()))
+         (name (if arg
+                   (if (symbolp arg) arg (make-sym (str-upcase arg)))
+                   (let ((s (read-minibuffer (string-concat "Load theme (" (string-join* "/" (theme-names)) "): ")
+                                             "" (theme-names) 'theme)))
+                     (make-sym (str-upcase s))))))
+    (if (apply-theme name)
+        (progn (message "Theme: %s" (str-downcase (symbol-to-string name))) :t)
+        (user-error "No such theme: %s" (str-downcase (symbol-to-string name))))))
+
+;;; ------------------------------------------------------------------
+;;; screen geometry
+
+(setq *rows* 24)
+(setq *cols* 80)
+(defun text-height () (imax 1 (- *rows* 2)))
+
+;;; ------------------------------------------------------------------
+;;; overlays: transient highlight regions computed at redraw time
+;;; (line start end face); an END beyond the line length highlights the newline.
+
+(setq *extra-overlays* ())          ; list of (line start end face) set by commands (isearch)
+
+(defun collect-overlays (from to)   ; -> dict line -> list of (start end face)
+  (let ((d (make-dict)))
+    (defun add (o)
+      (let ((l (car o)))
+        (when (and (>= l from) (< l to))
+          (dput d (num->str l) (append (dget d (num->str l)) (list (cdr o)))))))
+    ;; region
+    (when (region-active-p)
+      (let* ((rb (region-bounds)) (a (car rb)) (b (cdr rb)) (l (car a)))
+        (while (<= l (car b))
+          (when (and (>= l from) (< l to))
+            (let* ((len (buf-line-length l))
+                   (s (if (= l (car a)) (cdr a) 0))
+                   (e (if (= l (car b)) (cdr b) (+ len 1))))
+              (when (< s e) (add (list l s e 'region)))))
+          (setf l (+ l 1)))))
+    (for-each f (buffer-props ':overlays)
+      (for-each o (f from to) (add o)))
+    (for-each o *extra-overlays* (add o))
+    (let ((ims (bf im-state)))
+      (when (and ims (dget ims 'keys) (> (dget ims 'len) 0))
+        (let ((s (dget ims 'start)))
+          (add (list (car s) (cdr s) (+ (cdr s) (dget ims 'len)) 'im-pending)))))
+    d))
+
+;;; ------------------------------------------------------------------
+;;; rendering one buffer line into segments
+
+(defun push-seg (acc face text)                    ; acc is reversed list of (face . text)
+  (if (and acc (eq (caar acc) face))
+      (cons (cons face (string-concat (cdar acc) text)) (cdr acc))
+      (cons (cons face text) acc)))
+
+(defun render-line (text spans ovs hscroll width tabw)
+  (let* ((n (slen text)) (i 0) (col 0) (vc 0) (acc ()) (sp spans)
+         (total (display-col text n tabw))
+         (limit (if (> total (+ hscroll width)) (- width 1) width)))
+    (while (and (< i n) (< vc limit))
+      (let* ((nx (u8-next text i)) (b (bref text i))
+             (face ()))
+        (while (and sp (<= (cadr (car sp)) i)) (setf sp (cdr sp)))
+        (when (and sp (<= (car (car sp)) i)) (setf face (caddr (car sp))))
+        (for-each o ovs (when (and (<= (car o) i) (< i (cadr o))) (setf face (caddr o))))
+        (let* ((w (char-display-width text i col tabw))
+               (s (cond ((= b 9) (spaces w))
+                        ((< b 32) (string-concat "^" (chr (+ b 64))))
+                        ((= b 127) "^?")
+                        (:else (substr text i nx)))))
+          (cond ((<= (+ col w) hscroll) ())               ; scrolled out
+                (:else
+                 (let* ((skip (imax 0 (- hscroll col))) (room (- limit vc)))
+                   (when (> skip 0) (setf s (substr-from s skip)))
+                   (when (> (slen s) room) (when (< b 128) (setf s (substr s 0 room))))
+                   (setf acc (push-seg acc face s))
+                   (setf vc (+ vc (if (< b 128) (slen s) (- w skip)))))))
+          (setf col (+ col w))
+          (setf i nx))))
+    ;; end of line highlight (region/overlay covering the newline)
+    (when (and (>= i n) (< vc limit))
+      (for-each o ovs
+        (when (and (<= (car o) n) (< n (cadr o)) (not (eq (caddr o) 'im-pending)))
+          (setf acc (push-seg acc (caddr o) " ")) (setf vc (+ vc 1)))))
+    (when (> total (+ hscroll width))
+      (setf acc (push-seg acc 'truncation "$")) (setf vc (+ vc 1)))
+    (when (< vc width) (setf acc (push-seg acc () (spaces (- width vc)))))
+    (reverse acc)))
+
+(defun push-slice (acc face text a b) (push-seg acc face (substr text a b)))
+
+;; Fast path for the common line: printable ASCII only, no overlays.  Works in
+;; runs (one substring per span) instead of per character; allocation is what
+;; costs in limo, so this is ~10x cheaper than render-line.
+(defun render-line-fast (text spans hscroll width)
+  (let* ((n (slen text)) (limit (if (> n (+ hscroll width)) (- width 1) width))
+         (b (imin n (+ hscroll limit))) (pos hscroll) (acc ()) (vc (imax 0 (- b hscroll))))
+    (when (< pos b)
+      (for-each sp spans
+        (let ((s (imax pos (car sp))) (e (imin b (cadr sp))))
+          (when (< s e)
+            (when (< pos s) (setf acc (push-slice acc () text pos s)))
+            (setf acc (push-slice acc (caddr sp) text s e))
+            (setf pos e))))
+      (when (< pos b) (setf acc (push-slice acc () text pos b))))
+    (when (> n (+ hscroll width))
+      (setf acc (push-seg acc 'truncation "$")) (setf vc (+ vc 1)))
+    (when (< vc width) (setf acc (push-seg acc () (spaces (- width vc)))))
+    (reverse acc)))
+
+;; Row cache: per buffer line, the segments and the ANSI string of its last
+;; rendering plus everything they depended on.  Moving point or scrolling then
+;; only re-renders lines that really changed.
+(setq *row-ansi* ())                                 ; ANSI string per screen row of the last frame (or nil)
+
+(defun rowcache-vector (n)
+  (let ((v (bf rowcache)))
+    (if (and v (>= (vector-len v) n)) v
+        (let ((nv (make-vector (imax 64 (* 2 n))))) (bf! rowcache nv) nv))))
+
+(defun render-row (l text spans ovs hs width tw gut cache)   ; -> (segs . ansi), cached
+  (let ((c (vector-ref cache l)))
+    (if (and c
+             (eq (nth 0 c) text) (eq (nth 1 c) spans) (= (nth 2 c) hs) (= (nth 3 c) width)
+             (= (nth 4 c) tw) (= (nth 5 c) gut) (= (nth 6 c) *face-gen*)
+             (if ovs (deepeq (nth 7 c) ovs) (not (nth 7 c))))
+        (cdr (cdr (cdr (cdr (cdr (cdr (cdr (cdr c))))))))
+        (let ((segs (if (and (not ovs) (re-test "^[ -~]*$" text))
+                        (render-line-fast text spans hs width)
+                        (render-line text spans ovs hs width tw))))
+          (when (> gut 0)
+            (setf segs (cons (cons 'line-number (string-concat (let ((s (num->str (+ l 1)))) (string-concat (spaces (- gut 1 (slen s))) s)) " ")) segs)))
+          (let ((res (cons segs (segs->ansi segs))))
+            (vector-set cache l (cons text (cons spans (cons hs (cons width (cons tw (cons gut (cons *face-gen* (cons ovs res)))))))))
+            res)))))
+
+(defun segs->plain (segs) (list-to-string (map1 cdr segs)))
+(defun segs->ansi (segs)
+  (let ((out ()))
+    (for-each s segs
+      (let ((sgr (face-sgr (car s))))
+        (setf out (cons (string-concat *esc* "[0" (if (and sgr (> (slen sgr) 0)) (string-concat ";" sgr) "") "m") out))
+        (setf out (cons (cdr s) out))))
+    (setf out (cons (string-concat *esc* "[0m") out))
+    (list-to-string (reverse out))))
+(defun segs->tagged (segs)                          ; test helper: {face|text}
+  (list-to-string
+   (map1 (lambda (s) (if (car s) (string-concat "{" (str-downcase (symbol-to-string (car s))) "|" (cdr s) "}") (cdr s))) segs)))
+
+;;; ------------------------------------------------------------------
+;;; the minibuffer / echo area state (set by minibuffer.limo)
+
+(setq *mb-active* ())            ; nil or (prompt text cursor-byte)
+(setq *echo-extra* "")
+
+(defun line-number-width ()
+  (if (minor-mode-enabled-p 'display-line-numbers-mode)
+      (+ 1 (imax 3 (slen (num->str (buf-nlines)))))
+      0))
+
+;;; ------------------------------------------------------------------
+;;; window scrolling
+
+(defun ensure-point-visible ()
+  (let* ((h (text-height)) (l (point-line)) (top (bf top)) (nl (buf-nlines))
+         (gut (line-number-width)) (width (- *cols* gut)))
+    (when (bf recenter)
+      (setf top (imax 0 (- l (idiv h 2))))
+      (bf! recenter ()))
+    (cond ((< l top) (setf top (if (< (- top l) 3) l (imax 0 (- l (idiv h 2))))))
+          ((>= l (+ top h)) (setf top (if (< (- l (+ top h)) 3) (+ (- l h) 1) (imax 0 (- l (idiv h 2)))))))
+    (when (> top (- nl 1)) (setf top (- nl 1)))
+    (bf! top (imax 0 top))
+    ;; horizontal scroll
+    (let* ((tw (var 'tab-width)) (col (display-col (buf-line l) (point-col) tw)) (hs (bf hscroll)))
+      (cond ((>= col (+ hs (- width 1))) (setf hs (imax 0 (- col (- width 20)))))
+            ((< col hs) (setf hs (imax 0 (- col 20)))))
+      (when (< (display-col (buf-line l) (slen (buf-line l)) tw) width) (setf hs 0))
+      (bf! hscroll hs))))
+
+;;; ------------------------------------------------------------------
+;;; mode line & echo area
+
+(defun mode-line-text ()
+  (let* ((l (+ 1 (point-line))) (c (display-col (buf-line (point-line)) (point-col) (var 'tab-width)))
+         (nl (buf-nlines)) (top (bf top)) (h (text-height))
+         (pct (cond ((and (= top 0) (>= h (- nl top))) "All")
+                    ((= top 0) "Top")
+                    ((>= (+ top h) nl) "Bot")
+                    (:else (string-concat (num->str (idiv (* 100 top) (imax 1 (- nl h)))) "%"))))
+         (flag (cond ((bf readonly) "%%") ((bf modified) "**") (:else "--"))))
+    (string-concat "-:" flag "-  " (bf name) "   " pct " (" (num->str l) "," (num->str c) ")   ("
+                   (mode-line-modes) ")  ")))
+
+(defun fit-width (s w)                              ; pad/truncate by chars
+  (let ((n (u8-length s)))
+    (cond ((= n w) s)
+          ((< n w) (string-concat s (spaces (- w n))))
+          (:else (let ((i 0) (c 0)) (while (< c w) (setf i (u8-next s i)) (setf c (+ c 1))) (substr s 0 i))))))
+
+;;; ------------------------------------------------------------------
+;;; building a frame: returns (rows-of-segments . (cursor-row . cursor-col))
+
+(defun text-rows (top h nl hs width tw gut ovs any-ovs)    ; -> (rows . ansi-strings) for the text area
+  (let ((rows ()) (ansis ()) (r 0)
+        (cache (rowcache-vector (+ nl 1)))
+        (scan (progn (ensure-syntax-capacity) (buffer-prop ':scan-line))))
+    (while (< r h)
+      (let ((l (+ top r)))
+        (if (< l nl)
+            (let ((res (render-row l (buf-line l) (if scan (line-spans-view l) ()) (if any-ovs (dget ovs (num->str l)) ())
+                                   hs width tw gut cache)))
+              (setf rows (cons (car res) rows))
+              (setf ansis (cons (cdr res) ansis)))
+            (progn (setf rows (cons (list (cons () (spaces *cols*))) rows))
+                   (setf ansis (cons () ansis)))))
+      (setf r (+ r 1)))
+    (cons (reverse rows) (reverse ansis))))
+
+(defun build-frame ()
+  (ensure-point-visible)
+  (let* ((h (text-height)) (top (bf top)) (nl (buf-nlines)) (tw (var 'tab-width))
+         (gut (line-number-width)) (width (- *cols* gut)) (hs (bf hscroll))
+         (ovs (collect-overlays top (+ top h))) (any-ovs (if (dkeys ovs) :t ()))
+         (key (list (bf tick) top h hs width gut tw *face-gen* *spans-version* *cols* (bf major) nl))
+         (fc (bf framecache))
+         (tr (cond ((and (not any-ovs) fc (deepeq (car fc) key)) (cdr fc))   ; nothing visible changed: reuse the rows
+                   (:else (let ((res (text-rows top h nl hs width tw gut ovs any-ovs)))
+                            (bf! framecache (if any-ovs () (cons key res)))
+                            res))))
+         (rows (car tr)))
+    (setf *row-ansi* (cdr tr))
+    (let* ((ml (list (cons 'mode-line (fit-width (mode-line-text) *cols*))))
+           (echo-text (if *mb-active*
+                          (string-concat (car *mb-active*) (cadr *mb-active*))
+                          *message*))
+           (echo (list (cons () (fit-width echo-text *cols*)))))
+      (when *mb-active*
+        (setf echo (list (cons 'prompt (car *mb-active*))
+                         (cons () (fit-width (string-concat (cadr *mb-active*) *mb-hint*) (imax 0 (- *cols* (u8-length (car *mb-active*)))))))))
+      (setf rows (append rows (list ml echo))))
+    (let ((cur (if *mb-active*
+                   (cons (- *rows* 1)
+                         (+ (u8-length (car *mb-active*))
+                            (u8-count (cadr *mb-active*) 0 (caddr *mb-active*))))
+                   (cons (- (point-line) top)
+                         (+ gut (- (display-col (buf-line (point-line)) (point-col) tw) hs))))))
+      (cons rows cur))))

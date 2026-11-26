@@ -1,0 +1,197 @@
+;; -*- limo -*-
+;; limacs/lib/term.limo --- terminal I/O.
+;;
+;; Two back ends with the same small interface:
+;;   tty  : ncurses does raw mode + key decoding, we draw with ANSI escapes
+;;          (limo strings are bytes, so UTF-8 text passes straight through)
+;;   test : keys come from a script, frames are dumped as text (see tests/)
+;;
+;;   (term-init) (term-exit) (term-read-key) (term-key-pending-p)
+;;   (term-show frame) (term-resize)
+
+(setq *term-kind* 'tty)
+(setq *nc-scr* ())
+(setq *pushback* ())
+(setq *prev-rows* ())
+(setq *key-names* (make-dict))
+(setq *last-frame* ())
+
+;;; ------------------------------------------------------------------
+;;; key naming (shared by both back ends)
+
+(defun ctrl-key-name (c)
+  (cond ((= c 0) "C-SPC") ((= c 9) "TAB") ((= c 13) "RET") ((= c 27) "ESC")
+        ((= c 127) "DEL") ((= c 32) "SPC")
+        ((< c 27) (string-concat "C-" (chr (+ c 96))))
+        ((= c 28) "C-\\") ((= c 29) "C-]") ((= c 30) "C-^") ((= c 31) "C-_")
+        (:else (chr c))))
+
+(defun define-nc-keys ()
+  (let ((names '((key_up . "<up>") (key_down . "<down>") (key_left . "<left>") (key_right . "<right>")
+                 (key_home . "<home>") (key_end . "<end>") (key_npage . "<next>") (key_ppage . "<prior>")
+                 (key_dc . "<delete>") (key_ic . "<insert>") (key_backspace . "DEL") (key_enter . "RET")
+                 (key_btab . "<backtab>") (key_f1 . "<f1>") (key_f2 . "<f2>") (key_f3 . "<f3>")
+                 (key_f4 . "<f4>") (key_f5 . "<f5>") (key_f6 . "<f6>") (key_f7 . "<f7>")
+                 (key_f8 . "<f8>") (key_f9 . "<f9>") (key_f10 . "<f10>") (key_f11 . "<f11>")
+                 (key_f12 . "<f12>") (key_resize . "<resize>") (key_a1 . "<home>") (key_a3 . "<prior>")
+                 (key_c1 . "<end>") (key_c3 . "<next>"))))
+    (for-each p names
+      (let ((code (try (eval (list (quote env-getq) (quote *nc-env*) (car p)) *genv*) ())))
+        (when code (dict-set *key-names* (num->str code) (cdr p)))))))
+
+;;; ------------------------------------------------------------------
+;;; test back end
+
+(defun key-token-p (tok)
+  (or (member tok '("RET" "TAB" "SPC" "DEL" "ESC" "LFD"))
+      (re-test "^<[a-z0-9-]+>$" tok)
+      (re-test "^((C|M)-)+[^ ]+$" tok)
+      (re-test "^@[a-z-]+" tok)))
+
+(defun keys->events (s)                             ; "C-x C-f foo RET" -> events
+  (let ((res ()))
+    (for-each tok (split-by s " ")
+      (when (> (slen tok) 0)
+        (cond ((and (key-token-p tok) (not (eq (substr tok 0 1) "@")))
+               (for-each e (kbd-parse tok) (setf res (cons e res))))
+              ((eq (substr tok 0 1) "@") (setf res (cons tok res)))
+              ((= (u8-length tok) 1) (setf res (cons tok res)))
+              (:else
+               (let ((i 0))
+                 (while (< i (slen tok))
+                   (setf res (cons (u8-char-at tok i) res))
+                   (setf i (u8-next tok i))))))))
+    (reverse res)))
+
+(setq *test-keys* ())
+(setq *dump-mode* 'plain)
+
+(defun dump-frame ()
+  (let ((fr *last-frame*))
+    (print "----------------------------------------\n")
+    (for-each row (car fr)
+      (print (string-concat (if (eq *dump-mode* 'tagged) (segs->tagged row) (segs->plain row)) "\n")))
+    (print (string-concat "cursor: row " (num->str (cadr fr)) " col " (num->str (cddr fr)) "\n"))))
+
+;;; ------------------------------------------------------------------
+;;; tty back end
+
+(setq *nc-env* ())
+(defmacro nc-fn (q) `(env-getq *nc-env* ,(cadr q)))
+
+(defun term-init ()
+  (cond ((eq *term-kind* 'test) ())
+        (:else
+         (mod-load "ncurses")
+         (setf *nc-env* _ncurses)
+         (setf *nc-scr* ((nc-fn 'initscr)))
+         ((nc-fn 'raw)) ((nc-fn 'noecho)) ((nc-fn 'nonl))
+         ((nc-fn 'keypad) *nc-scr* :t)
+         ((nc-fn 'wrefresh) *nc-scr*)
+         (define-nc-keys)
+         (term-resize)
+         (term-write (string-concat *esc* "[2J")))))
+
+(defun term-resize ()
+  (cond ((eq *term-kind* 'test) ())
+        (:else
+         (let ((sz ((nc-fn 'getmaxyx) *nc-scr*)))
+           (setf *rows* (car sz)) (setf *cols* (cdr sz))
+           (setf *prev-rows* (make-vector (+ *rows* 1)))))))
+
+(defun term-exit ()
+  (syn-stop)
+  (unless (eq *term-kind* 'test)
+    (term-write (string-concat *esc* "[0m" *esc* "[?25h"))
+    ((nc-fn 'endwin))))
+
+(defun term-write (s) (file-write stdout s))
+
+(defun term-raw-getch () ((nc-fn 'wgetch) *nc-scr*))
+
+(defun term-wait-getch ()                  ; like term-raw-getch, but merges background syntax results while idle
+  (cond ((and *syntax-async* (> *syn-pending* 0))
+         ((nc-fn 'nodelay) *nc-scr* :t)
+         (let ((c (term-raw-getch)))
+           (while (and (< c 0) (> *syn-pending* 0))
+             (sleep 1/50)
+             (when (syn-poll) (redraw))
+             (setf c (term-raw-getch)))
+           ((nc-fn 'nodelay) *nc-scr* ())
+           (if (< c 0) (term-raw-getch) c)))
+        (:else (term-raw-getch))))
+
+(defun term-read-key ()                    ; every event from the outside world passes here (macro recording)
+  (let ((k (term-read-key-raw))) (kmacro-note k) k))
+
+(defun term-read-key-raw ()
+  (cond ((eq *term-kind* 'test)
+         (let ((res ()))
+           (while (not res)
+             (cond ((not *test-keys*) (throw 'test-eof))
+                   (:else
+                    (let ((k (car *test-keys*)))
+                      (setf *test-keys* (cdr *test-keys*))
+                      (cond ((eq k "@dump") (redraw) (dump-frame))
+                            ((eq k "@wait") (syn-wait-idle))
+                            ((eq k "@tagged") (setf *dump-mode* 'tagged))
+                            ((eq k "@plain") (setf *dump-mode* 'plain))
+                            (:else (setf res k)))))))
+           res))
+        (:else
+         (let ((c (term-wait-getch)))
+           (cond ((< c 0) (term-read-key-raw))
+                 ((>= c 256)
+                  (let ((n (dget *key-names* (num->str c))))
+                    (cond ((eq n "<resize>") (term-resize) ((nc-fn 'wrefresh) *nc-scr*) "<resize>")
+                          (n n)
+                          (:else (term-read-key-raw)))))
+                 ((>= c 192)                           ; UTF-8 lead byte: collect the rest
+                  (let ((l (list (chr c))) (more (- (u8-seq-len c) 1)))
+                    (while (> more 0) (setf l (cons (chr (term-raw-getch)) l)) (setf more (- more 1)))
+                    (list-to-string (reverse l))))
+                 ((>= c 128) (term-read-key-raw))
+                 (:else (ctrl-key-name c)))))))
+
+(defun term-key-pending-p ()                       ; is more input waiting? (to skip redraws)
+  (cond ((eq *term-kind* 'test) (and *test-keys* (not (member (car *test-keys*) '("@dump" "@tagged" "@plain")))))
+        (*pushback* :t)
+        (:else
+         ((nc-fn 'nodelay) *nc-scr* :t)
+         (let ((c (term-raw-getch)))
+           ((nc-fn 'nodelay) *nc-scr* ())
+           (cond ((< c 0) ())
+                 (:else
+                  ;; put it back as an event: decode via a one-shot queue of raw codes
+                  (setf *pushback* (list (decode-raw-first c)))
+                  (kmacro-note (car *pushback*))
+                  :t))))))
+
+(defun decode-raw-first (c)
+  (cond ((>= c 256) (let ((n (dget *key-names* (num->str c)))) (or n "<unknown>")))
+        ((>= c 192) (let ((l (list (chr c))) (more (- (u8-seq-len c) 1)))
+                      (while (> more 0) (setf l (cons (chr (term-raw-getch)) l)) (setf more (- more 1)))
+                      (list-to-string (reverse l))))
+        ((>= c 128) "<unknown>")
+        (:else (ctrl-key-name c))))
+
+(defun term-show (fr)
+  (setf *last-frame* fr)
+  (unless (eq *term-kind* 'test)
+    (let ((out (list (string-concat *esc* "[?25l"))) (r 0) (ans *row-ansi*))
+      (setf *row-ansi* ())
+      (for-each row (car fr)
+        (let ((ansi (or (if ans (car ans) ()) (segs->ansi row))))
+          (when ans (setf ans (cdr ans)))
+          (unless (eq (vector-ref *prev-rows* r) ansi)
+            (vector-set *prev-rows* r ansi)
+            (setf out (cons ansi (cons (string-concat *esc* "[" (num->str (+ r 1)) ";1H") out)))))
+        (setf r (+ r 1)))
+      (setf out (cons (string-concat *esc* "[" (num->str (+ 1 (cadr fr))) ";" (num->str (+ 1 (cddr fr))) "H" *esc* "[?25h") out))
+      (term-write (list-to-string (reverse out))))))
+
+(defun term-force-redraw ()
+  (when *prev-rows* (setf *prev-rows* (make-vector (+ *rows* 1))))
+  (unless (eq *term-kind* 'test) (term-write (string-concat *esc* "[2J"))))
+
+(defun redraw () (term-show (build-frame)) (syn-plan))

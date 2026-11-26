@@ -1,0 +1,210 @@
+;; -*- limo -*-
+;; limacs/lib/kmacro.limo --- keyboard macros.
+;;
+;;   F3 / C-x (        start recording (while recording, F3 inserts the macro counter)
+;;   F4 / C-x )        stop recording; with no recording in progress, F4 runs the last macro
+;;   C-x e             stop recording if needed, then run the last macro
+;;   C-u N F4          run N times;  C-u 0 F4  run until an error (e.g. a failed search)
+;;   C-x C-k b         bind the last macro to a key      C-x C-k n   name it (then M-x NAME)
+;;   C-x C-k r         run it on every line of the region
+;;   C-x C-k C-n/C-p   cycle the macro ring              C-x C-k v   show the last macro
+;;   C-x C-k C-i/C-c/C-a/C-f   insert / set / add to the counter, set its format
+;;   M-x insert-kbd-macro    insert (define-kmacro ...) code for your init file
+;;
+;; How it works: events are recorded where they enter the editor (the terminal reader);
+;; playback feeds them back through `read-event`, so a macro goes through exactly the same
+;; key lookup, minibuffer and command code as typing.  Any error aborts the running macro.
+
+(setq *kmacro-recording* ())      ; :t while defining
+(setq *kmacro-rec* ())            ; events recorded so far, newest first
+(setq *kmacro-count* 0)           ; number of events recorded
+(setq *kmacro-keep* 0)            ; events recorded before the current command began
+(setq *kmacro-last* ())           ; last macro: list of events
+(setq *kmacro-ring* ())           ; older macros, most recent first
+(setq *kmacro-queue* ())          ; events waiting to be "typed"
+(setq *kmacro-repeat* ())         ; macro to re-queue forever (C-u 0), or nil
+(setq *kmacro-executing* ())
+(setq *kmacro-strict* ())         ; synchronous run: running out of events is an error
+(setq *kmacro-counter* 0)
+(setq *kmacro-counter-format* "%d")
+(setq *kmacro-serial* 0)
+
+;;; ------------------------------------------------------------------
+;;; recording and playback hooks (called from the input layer)
+
+(defun kmacro-note (e)
+  (when *kmacro-recording*
+    (setf *kmacro-rec* (cons e *kmacro-rec*))
+    (setf *kmacro-count* (+ *kmacro-count* 1))))
+
+(defun kmacro-abort ()
+  (setf *kmacro-queue* ()) (setf *kmacro-repeat* ())
+  (setf *kmacro-executing* ()) (setf *kmacro-strict* ()))
+
+(defun kmacro-interrupted-p ()            ; a pending C-g stops an endless macro
+  (and (eq *term-kind* 'tty)
+       (term-key-pending-p)
+       (eq (car *pushback*) "C-g")
+       (progn (setf *pushback* (cdr *pushback*)) :t)))
+
+(defun kmacro-next-event ()               ; next queued event, or nil when no macro is running
+  (when (and (not *kmacro-queue*) *kmacro-repeat*)
+    (if (kmacro-interrupted-p)
+        (progn (kmacro-abort) (setf *message* "Quit"))
+        (setf *kmacro-queue* *kmacro-repeat*)))
+  (cond (*kmacro-queue*
+         (let ((e (car *kmacro-queue*))) (setf *kmacro-queue* (cdr *kmacro-queue*)) e))
+        (*kmacro-strict* (kmacro-abort) (user-error "Keyboard macro ended in the middle of a key sequence"))
+        (:else (setf *kmacro-executing* ()) ())))
+
+;;; ------------------------------------------------------------------
+;;; helpers
+
+(defun kmacro-text (evs) (string-join* " " evs))
+(defun kmacro-events (x) (if (consp x) x (kbd-parse x)))     ; list of events or a "C-a h i RET" string
+
+(defun kmacro-load (evs n)                ; queue EVS N times (0: until an error)
+  (let ((all ()) (i (if (= n 0) 1 n)))
+    (while (> i 0) (setf all (append evs all)) (setf i (- i 1)))
+    (setf *kmacro-queue* (append all *kmacro-queue*))
+    (setf *kmacro-executing* :t)
+    (when (= n 0) (setf *kmacro-repeat* evs))))
+
+(defun kmacro-run-sync (evs)              ; run EVS to completion inside the current command
+  (setf *kmacro-queue* evs) (setf *kmacro-executing* :t) (setf *kmacro-strict* :t)
+  (try (while *kmacro-queue* (ed-step))
+       (message "%s" (describe-error _exception)))
+  (kmacro-abort))
+
+(defun kmacro-push (evs)
+  (when (and *kmacro-last* (not (deepeq *kmacro-last* evs)))
+    (setf *kmacro-ring* (cons *kmacro-last* *kmacro-ring*)))
+  (setf *kmacro-last* evs))
+
+(defun kmacro-format-counter ()
+  (let* ((f *kmacro-counter-format*) (n (num->str *kmacro-counter*)) (i (str-index f "%d" 0)))
+    (if i (string-concat (substr f 0 i) n (substr-from f (+ i 2))) (string-concat f n))))
+
+;;; ------------------------------------------------------------------
+;;; commands
+
+(defun kmacro-start (append-p)
+  (when *kmacro-recording* (user-error "Already defining a keyboard macro"))
+  (setf *kmacro-rec* (if (and append-p *kmacro-last*) (reverse *kmacro-last*) ()))
+  (setf *kmacro-count* (list-length *kmacro-rec*))
+  (unless (and append-p *kmacro-last*) (setf *kmacro-counter* 0))
+  (setf *kmacro-recording* :t)
+  (message "Defining keyboard macro..."))
+
+(defun kmacro-end ()
+  (unless *kmacro-recording* (user-error "Not defining a keyboard macro"))
+  (setf *kmacro-recording* ())
+  ;; drop the keys that ended it (and anything typed to run the ending command)
+  (let ((evs (take (imax 0 *kmacro-keep*) (reverse *kmacro-rec*))))
+    (setf *kmacro-rec* ()) (setf *kmacro-count* 0)
+    (cond (evs (kmacro-push evs) (message "Keyboard macro defined (%s keys)" (num->str (list-length evs))))
+          (:else (message "Ignoring empty keyboard macro")))))
+
+(defun kmacro-call (n)
+  (unless *kmacro-last* (user-error "No keyboard macro defined"))
+  (kmacro-load *kmacro-last* n))
+
+(defcommand kmacro-start-macro () "Start recording a keyboard macro (C-u: append to the last one)."
+  (kmacro-start (prefix-raw)))
+(defcommand kmacro-end-macro () "Stop recording the keyboard macro." (kmacro-end))
+(defcommand kmacro-insert-counter () "Insert the macro counter and increment it."
+  (insert (kmacro-format-counter))
+  (setf *kmacro-counter* (+ *kmacro-counter* 1)))
+(defcommand kmacro-start-macro-or-insert-counter () "F3: start recording, or insert the counter while recording/running."
+  (if (or *kmacro-recording* *kmacro-executing*) (kmacro-insert-counter) (kmacro-start (prefix-raw))))
+(defcommand kmacro-end-or-call-macro () "F4: stop recording, or run the last macro (C-u N: N times, 0: until error)."
+  (if *kmacro-recording* (kmacro-end) (kmacro-call (prefix-n))))
+(defcommand kmacro-end-and-call-macro () "Stop recording if needed, then run the last macro."
+  (when *kmacro-recording* (kmacro-end))
+  (kmacro-call (prefix-n)))
+(defcommand call-last-kbd-macro () "Run the last keyboard macro." (kmacro-call (prefix-n)))
+
+(defcommand kmacro-set-counter () "Set the macro counter."
+  (setf *kmacro-counter* (if (prefix-raw) (prefix-n)
+                             (let ((s (read-minibuffer "Counter value: " "0" ()))) (or (str->num s) 0)))))
+(defcommand kmacro-add-counter () "Add the prefix argument (default 1) to the macro counter."
+  (setf *kmacro-counter* (+ *kmacro-counter* (prefix-n))))
+(defcommand kmacro-set-format () "Set the format of the macro counter (default %d)."
+  (let ((f (read-minibuffer "Counter format (e.g. item-%d): " *kmacro-counter-format* ())))
+    (setf *kmacro-counter-format* (if (= (slen f) 0) "%d" f))))
+
+(defcommand kmacro-view-macro () "Show the last keyboard macro."
+  (if *kmacro-last* (message "Macro: %s" (kmacro-text *kmacro-last*)) (message "No keyboard macro defined")))
+
+(defun kmacro-show-ring ()
+  (message "Macro%s: %s" (if *kmacro-ring* (string-concat " (+" (num->str (list-length *kmacro-ring*)) " more)") "")
+           (kmacro-text *kmacro-last*)))
+(defcommand kmacro-cycle-ring-previous () "Make the previous macro in the ring the current one."
+  (unless *kmacro-ring* (user-error "Keyboard macro ring is empty"))
+  (let ((old *kmacro-last*))
+    (setf *kmacro-last* (car *kmacro-ring*))
+    (setf *kmacro-ring* (append (cdr *kmacro-ring*) (list old)))
+    (kmacro-show-ring)))
+(defcommand kmacro-cycle-ring-next () "Make the next macro in the ring the current one."
+  (unless *kmacro-ring* (user-error "Keyboard macro ring is empty"))
+  (let* ((r (reverse *kmacro-ring*)) (old *kmacro-last*))
+    (setf *kmacro-last* (car r))
+    (setf *kmacro-ring* (cons old (reverse (cdr r))))
+    (kmacro-show-ring)))
+
+;;; named / bound macros
+
+(defun define-kmacro (name keys . key)      ; (define-kmacro 'my-macro "C-a h i RET" ["C-c m"])
+  (let ((evs (kmacro-events keys)))
+    (register-command name (lambda () (kmacro-load evs (prefix-n))) (string-concat "Keyboard macro: " (kmacro-text evs)))
+    (when key (define-key *global-map* (car key) name))
+    name))
+
+(defcommand name-last-kbd-macro () "Give the last keyboard macro a command name."
+  (unless *kmacro-last* (user-error "No keyboard macro defined"))
+  (let ((name (read-minibuffer "Name for last kbd macro: " "" ())))
+    (when (= (slen name) 0) (user-error "No name given"))
+    (define-kmacro (make-sym (str-upcase name)) *kmacro-last*)
+    (message "Macro named %s (run it with M-x %s)" name name)))
+
+(defcommand kmacro-bind-to-key () "Bind the last keyboard macro to a key sequence."
+  (unless *kmacro-last* (user-error "No keyboard macro defined"))
+  (let ((evs ()) (done ()) (name (progn (setf *kmacro-serial* (+ *kmacro-serial* 1))
+                                        (make-sym (string-concat "KMACRO-" (num->str *kmacro-serial*))))))
+    (message "Bind last macro to key: ")
+    (while (not done)
+      (let ((e (read-event)))
+        (setf evs (append evs (list e)))
+        (let ((r (lookup-active evs))) (unless (keymap-p r) (setf done :t)))))
+    (define-kmacro name *kmacro-last* (key-label evs))
+    (message "Bound to %s" (key-label evs))))
+
+(defcommand insert-kbd-macro () "Insert (define-kmacro ...) code for the last macro, for your init file."
+  (unless *kmacro-last* (user-error "No keyboard macro defined"))
+  (let ((name (read-minibuffer "Macro name: " "my-macro" ())))
+    (insert (string-concat "(define-kmacro '" name " \"" (kmacro-text *kmacro-last*) "\")\n"))))
+
+(defcommand apply-macro-to-region-lines () "Run the last macro at the start of every line of the region."
+  (unless *kmacro-last* (user-error "No keyboard macro defined"))
+  (unless (region-active-p) (user-error "The region is not active"))
+  (let* ((rb (region-bounds)) (l (car (car rb))) (end (car (cdr rb))) (nl (buf-nlines)) (evs *kmacro-last*))
+    (deactivate-mark)
+    (while (<= l end)
+      (set-point (cons l 0))
+      (kmacro-run-sync evs)
+      (setf end (+ end (- (buf-nlines) nl)))
+      (setf nl (buf-nlines))
+      (setf l (+ l 1)))))
+
+;;; ------------------------------------------------------------------
+;;; key bindings
+
+(for-each p '(("<f3>" . kmacro-start-macro-or-insert-counter) ("<f4>" . kmacro-end-or-call-macro)
+              ("C-x (" . kmacro-start-macro) ("C-x )" . kmacro-end-macro) ("C-x e" . kmacro-end-and-call-macro)
+              ("C-x C-k C-k" . kmacro-end-or-call-macro) ("C-x C-k b" . kmacro-bind-to-key)
+              ("C-x C-k n" . name-last-kbd-macro) ("C-x C-k r" . apply-macro-to-region-lines)
+              ("C-x C-k v" . kmacro-view-macro) ("C-x C-k C-n" . kmacro-cycle-ring-next)
+              ("C-x C-k C-p" . kmacro-cycle-ring-previous) ("C-x C-k C-i" . kmacro-insert-counter)
+              ("C-x C-k C-c" . kmacro-set-counter) ("C-x C-k C-a" . kmacro-add-counter)
+              ("C-x C-k C-f" . kmacro-set-format))
+  (define-key *global-map* (car p) (cdr p)))

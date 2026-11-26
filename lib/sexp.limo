@@ -1,0 +1,139 @@
+;; -*- limo -*-
+;; limacs/lib/sexp.limo --- bracket matching and s-expression motion.
+;; Brackets inside comments and strings (as judged by the mode's highlighter)
+;; are ignored.
+
+(defun opener-p (c) (or (eq c "(") (eq c "[") (eq c "{")))
+(defun closer-p (c) (or (eq c ")") (eq c "]") (eq c "}")))
+(defun skip-face-p (l c) (let ((f (face-at l c))) (or (eq f 'comment) (eq f 'string) (eq f 'escape))))
+
+(defun scan-match-forward (p)                       ; P at an opener -> pos of its closer, or nil
+  (let ((l (car p)) (c (cdr p)) (depth 0) (res ()) (n (buf-nlines)) (limit (+ (car p) 3000)))
+    (while (and (< l n) (< l limit) (not res))
+      (let* ((s (buf-line l)) (len (slen s)))
+        (while (and (< c len) (not res))
+          (let ((ch (sref s c)))
+            (cond ((and (opener-p ch) (not (skip-face-p l c))) (setf depth (+ depth 1)))
+                  ((and (closer-p ch) (not (skip-face-p l c)))
+                   (setf depth (- depth 1))
+                   (when (= depth 0) (setf res (cons l c))))))
+          (setf c (+ c 1))))
+      (setf l (+ l 1)) (setf c 0))
+    res))
+
+(defun scan-match-backward (p)                      ; P at a closer -> pos of its opener
+  (let ((l (car p)) (c (cdr p)) (depth 0) (res ()) (limit (- (car p) 3000)))
+    (while (and (>= l 0) (> l limit) (not res))
+      (let ((s (buf-line l)))
+        (while (and (>= c 0) (not res))
+          (let ((ch (sref s c)))
+            (cond ((and (closer-p ch) (not (skip-face-p l c))) (setf depth (+ depth 1)))
+                  ((and (opener-p ch) (not (skip-face-p l c)))
+                   (setf depth (- depth 1))
+                   (when (= depth 0) (setf res (cons l c))))))
+          (setf c (- c 1))))
+      (setf l (- l 1))
+      (when (>= l 0) (setf c (- (slen (buf-line l)) 1))))
+    res))
+
+(defun scan-enclosing-open (p)                       ; innermost opener before P
+  (let ((l (car p)) (c (- (cdr p) 1)) (depth 0) (res ()) (limit (- (car p) 3000)))
+    (while (and (>= l 0) (> l limit) (not res))
+      (let ((s (buf-line l)))
+        (while (and (>= c 0) (not res))
+          (let ((ch (sref s c)))
+            (cond ((and (closer-p ch) (not (skip-face-p l c))) (setf depth (+ depth 1)))
+                  ((and (opener-p ch) (not (skip-face-p l c)))
+                   (if (= depth 0) (setf res (cons l c)) (setf depth (- depth 1))))))
+          (setf c (- c 1))))
+      (setf l (- l 1))
+      (when (>= l 0) (setf c (- (slen (buf-line l)) 1))))
+    res))
+
+;;; show-paren
+(defun show-paren-compute ()
+  (let ((cache (bf paren-cache)))
+    (if (and cache (= (car cache) (bf tick)) (pos= (cadr cache) (point)))
+        (cddr cache)
+        (let ((res (show-paren-compute-1)))
+          (bf! paren-cache (cons (bf tick) (cons (point) res)))
+          res))))
+(defun show-paren-compute-1 ()
+  (let* ((p (point)) (l (car p)) (c (cdr p)) (s (buf-line l)) (res ()))
+    (cond ((and (< c (slen s)) (opener-p (sref s c)) (not (skip-face-p l c)))
+           (let ((m (scan-match-forward p)))
+             (setf res (if m (list (list l c (+ c 1) 'paren-match) (list (car m) (cdr m) (+ (cdr m) 1) 'paren-match))
+                           (list (list l c (+ c 1) 'paren-mismatch))))))
+          ((and (> c 0) (closer-p (sref s (- c 1))) (not (skip-face-p l (- c 1))))
+           (let ((m (scan-match-backward (cons l (- c 1)))))
+             (setf res (if m (list (list l (- c 1) c 'paren-match) (list (car m) (cdr m) (+ (cdr m) 1) 'paren-match))
+                           (list (list l (- c 1) c 'paren-mismatch)))))))
+    res))
+
+;;; sexp motion
+(defun skip-ws-forward (p)
+  (let ((q p) (c (char-at p)))
+    (while (and c (or (eq c "\n") (ws-char-p c))) (setf q (next-pos q)) (setf c (char-at q)))
+    q))
+(defun skip-ws-backward (p)
+  (let ((q p) (c (char-before-pos p)))
+    (while (and c (or (eq c "\n") (ws-char-p c))) (setf q (prev-pos q)) (setf c (char-before-pos q)))
+    q))
+(defun sexp-atom-char-p (c) (and c (not (eq c "\n")) (not (ws-char-p c)) (not (opener-p c)) (not (closer-p c)) (not (eq c "\"")) (not (eq c ";"))))
+
+(defun pos-forward-sexp (p)
+  (let* ((q (skip-ws-forward p)) (c (char-at q)) (l (car q)) (col (cdr q)))
+    (cond ((not c) (user-error "End of buffer"))
+          ((closer-p c) (user-error "Containing expression ends prematurely"))
+          ((and (opener-p c) (not (skip-face-p l col)))
+           (let ((m (scan-match-forward q))) (if m (next-pos m) (user-error "Unbalanced parentheses"))))
+          ((eq c "\"")                                   ; whole string literal
+           (let ((s (buf-line l)) (i (+ col 1)) (done ()))
+             (while (and (< i (slen s)) (not done))
+               (cond ((eq (sref s i) "\\") (setf i (+ i 2))) ((eq (sref s i) "\"") (setf done :t)) (:else (setf i (+ i 1)))))
+             (cons l (imin (slen s) (+ i 1)))))
+          (:else
+           (let ((r q) (ch c))
+             (while (sexp-atom-char-p ch) (setf r (next-pos r)) (setf ch (char-at r)))
+             (when (and (opener-p ch) (> (cdr r) (cdr q)) ()) ())
+             r)))))
+(defun pos-backward-sexp (p)
+  (let* ((q (skip-ws-backward p)) (c (char-before-pos q)) (l (car q)) (col (cdr q)))
+    (cond ((not c) (user-error "Beginning of buffer"))
+          ((opener-p c) (user-error "Containing expression ends prematurely"))
+          ((and (closer-p c) (not (skip-face-p l (- col 1))))
+           (let ((m (scan-match-backward (cons l (- col 1)))))
+             (if m (backward-prefix-chars m) (user-error "Unbalanced parentheses"))))
+          ((eq c "\"")
+           (let ((s (buf-line l)) (i (- col 2)) (done ()))
+             (while (and (>= i 0) (not done))
+               (if (and (eq (sref s i) "\"") (not (and (> i 0) (eq (sref s (- i 1)) "\\")))) (setf done :t) (setf i (- i 1))))
+             (cons l (imax 0 i))))
+          (:else
+           (let ((r q) (ch c))
+             (while (sexp-atom-char-p ch) (setf r (prev-pos r)) (setf ch (char-before-pos r)))
+             (backward-prefix-chars r))))))
+(defun backward-prefix-chars (p)                           ; include ' ` , before a form
+  (let ((q p) (ch (char-before-pos p)))
+    (while (and ch (or (eq ch "'") (eq ch "`") (eq ch ",") (eq ch "@")) (= (car q) (car (prev-pos q)))) (setf q (prev-pos q)) (setf ch (char-before-pos q)))
+    q))
+
+(defcommand forward-sexp () "Move forward over a balanced expression."
+  (let ((n (prefix-n))) (while (> n 0) (set-point (pos-forward-sexp (point))) (setf n (- n 1)))
+    (while (< n 0) (set-point (pos-backward-sexp (point))) (setf n (+ n 1)))))
+(defcommand backward-sexp () "Move backward over a balanced expression."
+  (let ((n (prefix-n))) (while (> n 0) (set-point (pos-backward-sexp (point))) (setf n (- n 1)))))
+(defcommand backward-up-list () "Move to the opening bracket of the enclosing list."
+  (let ((m (scan-enclosing-open (point)))) (if m (set-point m) (user-error "At top level"))))
+(defcommand down-list () "Move into the next list."
+  (let ((q (point)) (c (char-at (point))))
+    (while (and c (not (opener-p c))) (setf q (next-pos q)) (setf c (char-at q)))
+    (if c (set-point (next-pos q)) (user-error "At bottom level"))))
+(defcommand kill-sexp () "Kill the following expression."
+  (kill-region-text (point) (pos-forward-sexp (point)) 'fwd))
+(defcommand indent-sexp () "Reindent the expression following point."
+  (let* ((a (car (skip-ws-forward (point)))) (e (pos-forward-sexp (point))))
+    (indent-lines a (car e))))
+(defcommand eval-last-sexp () "Evaluate the expression before point as limo code."
+  (let* ((e (point)) (s (pos-backward-sexp e)) (text (buffer-substring s e)))
+    (message "%s" (print-value (eval-string text)))))

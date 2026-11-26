@@ -1,0 +1,371 @@
+;; -*- limo -*-
+;; limacs/modes/dired.limo --- a directory editor.
+;;
+;;   C-x d  (dired)          open a directory      C-x C-j  jump to the current file's directory
+;;   find-file on a directory opens dired as well.
+;;
+;; In the listing:  n/p move · RET/f visit · v view · ^ parent · g refresh · s sort by name/date
+;;   m mark · u unmark · U unmark all · t toggle marks · d flag for deletion · x delete flagged
+;;   % m / % d  mark / flag by regexp · D delete · R rename/move · C copy · + make directory
+;;   ! shell command on the files · w copy the file name · q quit
+;; Operations work on the marked files, or on the file at point when nothing is marked.
+;; Files are listed and changed by running ls, rm, mv, cp and mkdir (limo's popen).
+
+(mod-load "popen")
+
+;;; ------------------------------------------------------------------
+;;; running programs
+
+(defun read-all-fd (fd)
+  (let ((f (file-fdopen fd "r")) (parts ()) (chunk "x"))
+    (while (> (slen chunk) 0)
+      (setf chunk (file-read f 65536))
+      (when (> (slen chunk) 0) (setf parts (cons chunk parts))))
+    (file-close f)
+    (list-to-string (reverse parts))))
+
+(defun run-process (prog . args)         ; -> (status stdout . stderr); runs PROG via env(1), LC_ALL=C
+  (let* ((r (popen "/usr/bin/env" (append (list "env" "LC_ALL=C" prog) args) () () :t :t))
+         (out (read-all-fd (cdr (assoc 'stdout r))))
+         (err (read-all-fd (cdr (assoc 'stderr r))))
+         (status (popen-wait (cdr (assoc 'pid r)))))
+    (cons status (cons out err))))
+
+(defun process-ok-p (r) (eq (car r) 0))
+(defun process-error-text (r)
+  (let ((e (str-trim (cddr r)))) (if (> (slen e) 0) (car (split-lines e)) "command failed")))
+
+(defun shell-quote (s)
+  (let ((parts ()) (i 0) (j ()))
+    (while (setf j (str-index s "'" i))
+      (setf parts (cons (string-concat (substr s i j) "'\\''") parts))
+      (setf i (+ j 1)))
+    (string-concat "'" (list-to-string (reverse (cons (substr-from s i) parts))) "'")))
+
+;;; ------------------------------------------------------------------
+;;; entries
+
+(setq *dired-entry-regex*
+      "^(. [-dlcbpsD?][-rwxsStT.+@ ]* +[0-9]+ +[^ ]+ +[^ ]+ +[0-9, ]+ +[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} )(.*)$")
+
+(defun dired-entry (l)                    ; (name name-col kind marker) for line L, or nil
+  (let ((m (if (> l 0) (re-match *dired-entry-regex* (buf-line l) 3) ())))
+    (if m
+        (let* ((s (buf-line l)) (name (caddr m)) (arrow (str-index name " -> " 0)))
+          (list (if arrow (substr name 0 arrow) name) (slen (cadr m)) (sref s 2) (sref s 0)))
+        ())))
+
+(defun dired-dir () (dget *cb* 'dired-dir))
+(defun dired-path (name) (string-concat (dired-dir) name))
+(defun dired-dot-p (name) (or (eq name ".") (eq name "..")))
+
+(defun dired-line-file ()                 ; entry on the current line or an error
+  (let ((e (dired-entry (point-line))))
+    (unless e (user-error "No file on this line"))
+    e))
+
+(defun dired-all-entries ()               ; list of (line . entry)
+  (let ((res ()) (l 1))
+    (while (< l (buf-nlines))
+      (let ((e (dired-entry l))) (when e (setf res (cons (cons l e) res))))
+      (setf l (+ l 1)))
+    (reverse res)))
+
+(defun dired-targets ()                   ; names to operate on: marked files, else the one at point
+  (let ((marked ()))
+    (for-each p (dired-all-entries)
+      (when (and (eq (nth 4 p) "*") (not (dired-dot-p (cadr p)))) (setf marked (cons (cadr p) marked))))
+    (cond (marked (reverse marked))
+          (:else (let ((e (dired-line-file)))
+                   (when (dired-dot-p (car e)) (user-error "Cannot operate on %s" (car e)))
+                   (list (car e)))))))
+
+(defun dired-flagged ()
+  (let ((res ()))
+    (for-each p (dired-all-entries)
+      (when (eq (nth 4 p) "D") (setf res (cons (cadr p) res))))
+    (reverse res)))
+
+(defun dired-count-label (names)
+  (if (cdr names) (string-concat (num->str (list-length names)) " files") (car names)))
+
+;;; ------------------------------------------------------------------
+;;; highlighting
+
+(defun dired-scan-line (line state)
+  (let ((m (re-match *dired-entry-regex* line 3)) (n (slen line)))
+    (cond
+     ((not m) (cons (if (str-prefix-p "  /" line) (list (list 0 n 'function)) ()) state))
+     (:else
+      (let* ((nc (slen (cadr m))) (marker (sref line 0)) (kind (sref line 2))
+             (name-face (cond ((eq marker "D") 'error) ((eq marker "*") 'match-case)
+                              ((eq kind "d") 'type) ((eq kind "l") 'builtin)
+                              ((eq (sref line 5) "x") 'keyword) (:else ())))
+             (spans (list (list 2 12 'comment))))
+        (when (> (slen line) 0)
+          (when (or (eq marker "D") (eq marker "*")) (setf spans (cons (list 0 1 name-face) spans))))
+        (when name-face (setf spans (append spans (list (list nc n name-face)))))
+        (cons (sort (lambda (a b) (< (car a) (car b))) spans) state))))))
+
+;;; ------------------------------------------------------------------
+;;; the buffer
+
+(defmacro with-writable body
+  (with-gensym (old)
+    `(let ((,old (bf readonly)))
+       (bf! readonly ())
+       (finally (progn ,@body) (bf! readonly ,old)))))
+
+(defun dired-parent (dir)                 ; "/a/b/" -> "/a/"
+  (let* ((d (if (and (> (slen dir) 1) (str-suffix-p "/" dir)) (substr dir 0 (- (slen dir) 1)) dir))
+         (i (str-rindex d "/" (slen d))))
+    (if (and i (> i 0)) (substr d 0 (+ i 1)) "/")))
+
+(defun dired-normalize (path)             ; absolute, ends in "/"
+  (let* ((p (expand-file-name path))
+         (abs (if (str-prefix-p "/" p) p (string-concat (default-directory) p))))
+    (if (str-suffix-p "/" abs) abs (string-concat abs "/"))))
+
+(defun dired-collect-marks ()
+  (let ((d (make-dict)))
+    (for-each p (dired-all-entries)
+      (unless (eq (nth 4 p) " ") (dput d (cadr p) (nth 4 p))))
+    d))
+
+(defun dired-goto-name (name)
+  (let ((l 1) (found ()))
+    (while (and (not found) (< l (buf-nlines)))
+      (let ((e (dired-entry l)))
+        (when (and e (eq (car e) name)) (setf found l)))
+      (setf l (+ l 1)))
+    (when found (set-point (cons found (cadr (dired-entry found)))))
+    found))
+
+(defun dired-revert ()                    ; re-read the directory, keeping marks and point
+  (let* ((dir (dired-dir))
+         (marks (dired-collect-marks))
+         (here (let ((e (dired-entry (point-line)))) (if e (car e) ())))
+         (line (point-line))
+         (r (run-process "ls" "-la" "--time-style=long-iso" (if (dget *cb* 'dired-by-time) "-t" "-v") "--" dir)))
+    (unless (process-ok-p r) (user-error "ls: %s" (process-error-text r)))
+    (let ((lines (cdr (filter (lambda (x) (> (slen x) 0)) (split-lines (cadr r))))))   ; drop "total N"
+      (with-writable
+       (erase-buffer)
+       (insert (string-concat "  " dir ":"))
+       (for-each x lines (insert (string-concat "\n  " x)))
+       (bf! undo ()) (bf! redo ()) (bf! modified ())
+       (for-each p (dict-to-list marks)
+         (let ((e (let ((res ()) (l 1))
+                    (while (and (not res) (< l (buf-nlines)))
+                      (let ((en (dired-entry l))) (when (and en (eq (car en) (car p))) (setf res l)))
+                      (setf l (+ l 1)))
+                    res)))
+           (when e (dired-set-marker e (cdr p)))))))
+    (bf! modified ())
+    (set-point (cons 0 0))
+    (cond ((and here (dired-goto-name here)) ())
+          (:else (set-point (cons (imin line (- (buf-nlines) 1)) 0))))
+    (setf *message* "")))
+
+(defun dired-set-marker (l ch)            ; caller must hold with-writable
+  (let ((pt (point)) (s (buf-line l)))
+    (delete-between (cons l 0) (cons l 1))
+    (insert-at (cons l 0) ch)
+    (bf! undo ()) (bf! modified ())
+    (bf! pt pt)))
+
+(defun dired-find-buffer (dir)
+  (let ((res ()))
+    (for-each b *buffers* (when (eq (dget b 'dired-dir) dir) (setf res b)))
+    res))
+
+(defun dired-open (path)                  ; show directory PATH in a dired buffer
+  (let* ((dir (dired-normalize path)) (b (dired-find-buffer dir)))
+    (unless (directory-p dir) (user-error "%s is not a directory" dir))
+    (cond (b (set-buffer b) (dired-revert))
+          (:else
+           (let* ((base (file-basename (substr dir 0 (- (slen dir) 1))))
+                  (nb (create-buffer (unique-buffer-name (if (eq base "") "/" base)))))
+             (set-buffer nb)
+             (bf! dired-dir dir)
+             (bf! file ())
+             (set-major-mode 'dired-mode)
+             (dired-revert)
+             (bf! readonly :t))))
+    *cb*))
+
+;;; ------------------------------------------------------------------
+;;; commands
+
+(defcommand dired () "Open a directory in dired."
+  (let ((dir (read-minibuffer "Dired (directory): " (default-directory) file-completions 'file)))
+    (dired-open dir)))
+
+(defcommand dired-jump () "Open the directory of the current file in dired."
+  (let ((d (default-directory)))
+    (dired-open d)
+    (let ((f (dget (car (cdr *buffers*)) 'file)))
+      (when f (dired-goto-name (file-basename f))))))
+
+(defun dired-move (n)
+  (let ((l (+ (point-line) n)))
+    (while (and (>= l 1) (< l (buf-nlines)) (not (dired-entry l))) (setf l (+ l n)))
+    (when (and (>= l 1) (< l (buf-nlines)))
+      (set-point (cons l (cadr (dired-entry l)))))))
+(defcommand dired-next-line () "Move to the next file." (dired-move 1))
+(defcommand dired-previous-line () "Move to the previous file." (dired-move -1))
+
+(defcommand dired-find-file () "Visit the file or directory on this line."
+  (let* ((e (dired-line-file)) (path (dired-path (car e))))
+    (cond ((eq (car e) "..") (dired-open (dired-parent (dired-dir))))
+          ((eq (car e) ".") (dired-open (dired-dir)))
+          ((directory-p path) (dired-open path))
+          (:else (visit-file path)))))
+
+(defcommand dired-view-file () "Visit the file read-only."
+  (dired-find-file)
+  (when (dget *cb* 'file) (bf! readonly :t)))
+
+(defcommand dired-up-directory () "Go to the parent directory."
+  (let ((from (file-basename (substr (dired-dir) 0 (- (slen (dired-dir)) 1)))))
+    (dired-open (dired-parent (dired-dir)))
+    (dired-goto-name from)))
+
+(defcommand dired-do-revert () "Re-read the directory." (dired-revert) (message "Directory refreshed"))
+
+(defcommand dired-toggle-sort () "Switch between sorting by name and by modification time."
+  (dput *cb* 'dired-by-time (not (dget *cb* 'dired-by-time)))
+  (dired-revert)
+  (message (if (dget *cb* 'dired-by-time) "Sorted by date" "Sorted by name")))
+
+(defun dired-mark-line (ch)
+  (let ((e (dired-line-file)))
+    (when (dired-dot-p (car e)) (user-error "Cannot mark %s" (car e)))
+    (with-writable (dired-set-marker (point-line) ch))
+    (dired-move 1)))
+(defcommand dired-mark () "Mark the file on this line." (dired-mark-line "*"))
+(defcommand dired-unmark () "Remove the mark from this line." (dired-mark-line " "))
+(defcommand dired-flag-file-deletion () "Flag the file for deletion." (dired-mark-line "D"))
+
+(defcommand dired-unmark-all-marks () "Remove all marks and flags."
+  (with-writable
+   (for-each p (dired-all-entries)
+     (unless (eq (nth 4 p) " ") (dired-set-marker (car p) " "))))
+  (message "All marks removed"))
+
+(defcommand dired-toggle-marks () "Mark the unmarked files and unmark the marked ones."
+  (with-writable
+   (for-each p (dired-all-entries)
+     (unless (dired-dot-p (cadr p))
+       (cond ((eq (nth 4 p) "*") (dired-set-marker (car p) " "))
+             ((eq (nth 4 p) " ") (dired-set-marker (car p) "*")))))))
+
+(defun dired-mark-regexp (ch prompt)
+  (let ((rx (read-minibuffer prompt "" ())))
+    (when (> (slen rx) 0)
+      (let ((n 0))
+        (with-writable
+         (for-each p (dired-all-entries)
+           (when (and (not (dired-dot-p (cadr p))) (re-test rx (cadr p)))
+             (dired-set-marker (car p) ch) (setf n (+ n 1)))))
+        (message "%s files marked" (num->str n))))))
+(defcommand dired-mark-files-regexp () "Mark files whose names match a regexp."
+  (dired-mark-regexp "*" "Mark files (regexp): "))
+(defcommand dired-flag-files-regexp () "Flag files whose names match a regexp for deletion."
+  (dired-mark-regexp "D" "Flag for deletion (regexp): "))
+
+(defun dired-run (what prog . args)        ; run a program, report failure, refresh
+  (let ((r (apply run-process (cons prog args))))
+    (dired-revert)
+    (if (process-ok-p r) (message "%s" what) (message "%s" (string-concat prog ": " (process-error-text r))))
+    (process-ok-p r)))
+
+(defun dired-run-in-dir (what script names)   ; run `sh -c SCRIPT sh DIR NAMES...` in the listed directory
+  (let ((r (apply run-process (append (list "sh" "-c" script "sh" (dired-dir)) names))))
+    (dired-revert)
+    (if (process-ok-p r) (message "%s" what) (message "%s" (process-error-text r)))
+    (process-ok-p r)))
+
+(defun dired-delete-files (names)
+  (when (y-or-n-p (string-concat "Delete " (dired-count-label names) "? (directories recursively) "))
+    (dired-run-in-dir (string-concat "Deleted " (dired-count-label names))
+                      "cd \"$1\" && shift && rm -rf -- \"$@\"" names)))
+
+(defcommand dired-do-flagged-delete () "Delete the files flagged with D."
+  (let ((names (dired-flagged)))
+    (if names (dired-delete-files names) (message "(No deletions requested)"))))
+
+(defcommand dired-do-delete () "Delete the marked files, or the file at point."
+  (dired-delete-files (dired-targets)))
+
+(defun dired-resolve (dest)               ; absolute destination for user input
+  (let ((d (expand-file-name dest)))
+    (if (str-prefix-p "/" d) d (string-concat (dired-dir) d))))
+
+(defcommand dired-do-rename () "Rename or move the marked files, or the file at point."
+  (let* ((names (dired-targets))
+         (dest (read-minibuffer (if (cdr names) (string-concat "Move " (dired-count-label names) " to: ") (string-concat "Rename " (car names) " to: "))
+                                (dired-dir) file-completions 'file)))
+    (when (= (slen dest) 0) (user-error "No destination"))
+    (let ((target (dired-resolve dest)))
+      (when (and (cdr names) (not (directory-p target))) (user-error "Target is not a directory: %s" target))
+      (dired-run-in-dir (string-concat "Moved " (dired-count-label names))
+                        "d=\"$1\"; t=\"$2\"; shift 2; cd \"$d\" && mv -- \"$@\" \"$t\"" (cons target names)))))
+
+(defcommand dired-do-copy () "Copy the marked files, or the file at point."
+  (let* ((names (dired-targets))
+         (dest (read-minibuffer (string-concat "Copy " (dired-count-label names) " to: ") (dired-dir) file-completions 'file)))
+    (when (= (slen dest) 0) (user-error "No destination"))
+    (let ((target (dired-resolve dest)))
+      (when (and (cdr names) (not (directory-p target))) (user-error "Target is not a directory: %s" target))
+      (dired-run-in-dir (string-concat "Copied " (dired-count-label names))
+                        "d=\"$1\"; t=\"$2\"; shift 2; cd \"$d\" && cp -r -- \"$@\" \"$t\"" (cons target names)))))
+
+(defcommand dired-create-directory () "Create a directory."
+  (let ((name (read-minibuffer "Create directory: " (dired-dir) file-completions 'file)))
+    (when (= (slen name) 0) (user-error "No name"))
+    (let ((path (dired-resolve name)))
+      (when (dired-run (string-concat "Created " path) "mkdir" "-p" "--" path)
+        (dired-goto-name (file-basename (if (str-suffix-p "/" path) (substr path 0 (- (slen path) 1)) path)))))))
+
+(defcommand dired-do-shell-command () "Run a shell command on the marked files (use * for the file list)."
+  (let* ((names (dired-targets))
+         (cmd (read-minibuffer (string-concat "! on " (dired-count-label names) ": ") "" ()))
+         (quoted (string-join* " " (map1 shell-quote names)))
+         (full (if (str-index cmd "*" 0)
+                   (let ((i (str-index cmd "*" 0))) (string-concat (substr cmd 0 i) quoted (substr-from cmd (+ i 1))))
+                   (string-concat cmd " " quoted)))
+         (r (run-process "sh" "-c" (string-concat "cd " (shell-quote (dired-dir)) " && " full))))
+    (dired-revert)
+    (let ((text (string-concat (cadr r) (cddr r))))
+      (if (> (slen (str-trim text)) 0)
+          (show-help-buffer "*Shell Command Output*" text)
+          (message "(Shell command %s)" (if (process-ok-p r) "succeeded with no output" "failed"))))))
+
+(defcommand dired-copy-filename () "Copy the name of the file at point to the kill ring."
+  (let ((e (dired-line-file))) (kill-new (dired-path (car e))) (message "%s" (dired-path (car e)))))
+
+(defcommand dired-quit () "Leave dired."
+  (kill-buffer-object *cb*))
+
+;;; ------------------------------------------------------------------
+;;; mode & keys
+
+(define-major-mode dired-mode () "Dired"
+  :scan-line dired-scan-line)
+
+(for-each p '(("n" . dired-next-line) ("p" . dired-previous-line) ("SPC" . dired-next-line)
+              ("C-n" . dired-next-line) ("C-p" . dired-previous-line)
+              ("<down>" . dired-next-line) ("<up>" . dired-previous-line)
+              ("RET" . dired-find-file) ("f" . dired-find-file) ("e" . dired-find-file) ("v" . dired-view-file)
+              ("^" . dired-up-directory) ("g" . dired-do-revert) ("s" . dired-toggle-sort)
+              ("m" . dired-mark) ("u" . dired-unmark) ("U" . dired-unmark-all-marks) ("t" . dired-toggle-marks)
+              ("d" . dired-flag-file-deletion) ("x" . dired-do-flagged-delete)
+              ("% m" . dired-mark-files-regexp) ("% d" . dired-flag-files-regexp)
+              ("D" . dired-do-delete) ("R" . dired-do-rename) ("C" . dired-do-copy)
+              ("+" . dired-create-directory) ("!" . dired-do-shell-command)
+              ("w" . dired-copy-filename) ("q" . dired-quit) ("h" . describe-mode))
+  (define-key dired-mode-map (car p) (cdr p)))
+
+(define-key *global-map* "C-x d" 'dired)
+(define-key *global-map* "C-x C-j" 'dired-jump)

@@ -1,0 +1,158 @@
+;; -*- limo -*-
+;; limacs/lib/files.limo --- visiting and saving files, switching buffers.
+
+(setq *auto-mode-alist* ())
+(defun add-auto-mode (regex mode) (setf *auto-mode-alist* (append *auto-mode-alist* (list (cons regex mode)))))
+(defun mode-for-file (name)
+  (let ((res 'text-mode))
+    (block found
+      (for-each p *auto-mode-alist* (when (re-test (car p) name) (setf res (cdr p)) (return-from found res))))
+    res))
+
+;; environment access without a getenv builtin: read /proc/self/environ
+(setq *env-cache* ())
+(defun env-var (name)
+  (unless *env-cache*
+    (setf *env-cache* (make-dict))
+    (try
+     (let* ((f (file-open "/proc/self/environ" "r")) (data (file-read f 65536)) (i 0) (start 0) (n (slen data)))
+       (while (<= i n)
+         (when (or (= i n) (= (bref data i) 0))
+           (let* ((ent (substr data start i)) (eq-pos (str-find-char ent "=" 0)))
+             (when eq-pos (dput *env-cache* (substr ent 0 eq-pos) (substr-from ent (+ eq-pos 1)))))
+           (setf start (+ i 1)))
+         (setf i (+ i 1)))
+       (file-close f))
+     ()))
+  (dget *env-cache* name))
+(defun default-directory ()                ; directory of the current buffer (dired dir, file's dir) or $PWD
+  (let ((d (cond ((and *cb* (dget *cb* 'dired-dir)) (dget *cb* 'dired-dir))
+                 ((and *cb* (dget *cb* 'file))
+                  (let* ((f (dget *cb* 'file)) (i (str-rindex f "/" (slen f)))) (if i (substr f 0 (+ i 1)) ())))
+                 (:else ()))))
+    (let ((d (or d (env-var "PWD") ".")))
+      (if (str-suffix-p "/" d) d (string-concat d "/")))))
+(defun expand-file-name (s)
+  (cond ((str-prefix-p "~/" s) (string-concat (or (env-var "HOME") ".") (substr-from s 1)))
+        ((eq s "~") (or (env-var "HOME") "."))
+        (:else s)))
+(defun file-basename (path)
+  (let ((i (str-rindex path "/" (slen path)))) (if i (substr-from path (+ i 1)) path)))
+(defun file-exists-p (path) (file-access path 0))
+(defun directory-p (path) (try (progn (file-readdir path) :t) ()))
+
+(defun file-completions (str)
+  (let* ((s (expand-file-name str)) (slash (str-rindex str "/" (slen str)))
+         (dir (if slash (substr str 0 (+ slash 1)) "")) (base (if slash (substr-from str (+ slash 1)) str))
+         (dpath (if (eq dir "") "." (expand-file-name dir)))
+         (entries (try (file-readdir dpath) ())) (res ()))
+    (for-each e entries
+      (let ((name (car e)) (kind (cadr e)))
+        (when (and (str-prefix-p base name) (not (eq name ".")) (not (eq name ".."))
+                   (or (str-prefix-p "." base) (not (str-prefix-p "." name))))
+          (setf res (cons (string-concat dir name (if (eq kind "d") "/" "")) res)))))
+    (sort string< res)))
+
+(defun read-file-contents (path)
+  (let* ((f (file-open path "r")))
+    (file-seek f 0 file-seek-end)
+    (let ((size (file-tell f)))
+      (file-seek f 0 file-seek-set)
+      (let ((data (file-read f size))) (file-close f) data))))
+
+(defun load-file-into-buffer (path)
+  (let* ((data (read-file-contents path)) (lines (split-lines data)))
+    ;; a trailing newline yields a final empty element: drop it (we re-add on save)
+    (when (and (cdr lines) (eq (car (last-cons lines)) ""))
+      (setf lines (reverse (cdr (reverse lines)))))
+    (bf! lines (make-vector (imax 64 (* 2 (list-length lines)))))
+    (bf! nlines 0)
+    (raw-replace-lines 0 0 lines)
+    (bf! nlines (list-length lines))
+    (bf! pt (cons 0 0)) (bf! undo ()) (bf! redo ()) (syn-bump) (bf! valid 0) (bf! modified ())
+    (bf! tick (+ 1 (bf tick)))))
+
+(defun visit-file (path)
+  (let* ((full (expand-file-name path)) (existing ()))
+    (for-each b *buffers* (when (eq (dget b 'file) full) (setf existing b)))
+    (cond ((directory-p full) (dired-open full))
+          (existing (set-buffer existing))
+          (:else
+           (let ((b (create-buffer (unique-buffer-name (file-basename full)))))
+             (set-buffer b)
+             (bf! file full)
+             (cond ((directory-p full) (user-error "%s is a directory" full))
+                   ((file-exists-p full) (load-file-into-buffer full))
+                   (:else (message "(New file)")))
+             (set-major-mode (mode-for-file full))
+             (run-hook 'find-file-hook)))))
+  *cb*)
+
+(defcommand find-file () "Visit a file."
+  (let ((path (read-minibuffer "Find file: " (default-directory) file-completions 'file)))
+    (when (= (slen path) 0) (user-error "No file name"))
+    (visit-file path)))
+
+(defun save-buffer-1 ()
+  (cond ((not (bf file)) (bf! file (expand-file-name (read-minibuffer "File to save in: " (default-directory) file-completions 'file)))
+                         (bf! name (file-basename (bf file)))))
+  (run-hook 'before-save-hook)
+  (let* ((text (join-lines (buf-lines-list 0 (buf-nlines))))
+         (final (if (> (slen text) 0) (string-concat text "\n") text))
+         (f (file-open (bf file) "w")))
+    (file-write f final) (file-close f))
+  (bf! modified ())
+  (run-hook 'after-save-hook)
+  (message "Wrote %s" (bf file)))
+(defcommand save-buffer () "Save the current buffer to its file."
+  (if (or (bf modified) (not (bf file))) (save-buffer-1) (message "(No changes need to be saved)")))
+(defcommand write-file () "Write the buffer to a new file."
+  (bf! file (expand-file-name (read-minibuffer "Write file: " (default-directory) file-completions 'file)))
+  (bf! name (file-basename (bf file)))
+  (set-major-mode (mode-for-file (bf file)))
+  (save-buffer-1))
+
+(defun buffer-names () (map1 (lambda (b) (dget b 'name)) *buffers*))
+(defcommand switch-to-buffer () "Select another buffer."
+  (let* ((other (if (cdr *buffers*) (dget (cadr *buffers*) 'name) ""))
+         (name (read-minibuffer (string-concat "Switch to buffer (default " other "): ") "" (buffer-names) 'buffer))
+         (nm (if (= (slen name) 0) other name)))
+    (set-buffer (or (get-buffer nm) (let ((b (create-buffer nm))) (with-buffer b (set-major-mode 'text-mode)) b)))))
+(defcommand kill-buffer () "Kill a buffer."
+  (let* ((name (read-minibuffer (string-concat "Kill buffer (default " (bf name) "): ") "" (buffer-names) 'buffer))
+         (b (if (= (slen name) 0) *cb* (get-buffer name))))
+    (unless b (user-error "No such buffer: %s" name))
+    (when (or (not (dget b 'modified)) (y-or-n-p (string-concat "Buffer " (dget b 'name) " modified; kill anyway? ")))
+      (kill-buffer-object b))))
+(defun kill-buffer-object (b)
+  (setf *buffers* (remove-item b *buffers*))
+  (unless *buffers* (let ((s (create-buffer "*scratch*"))) (with-buffer s (set-major-mode 'limo-mode)))) 
+  (when (eq b *cb*) (set-buffer (car *buffers*))))
+(defcommand next-buffer () "Switch to the next buffer."
+  (when (cdr *buffers*) (set-buffer (car (last-cons *buffers*)))))
+(defcommand list-buffers () "Display a list of buffers."
+  (let ((b (get-buffer-create "*Buffer List*")) (lines ()))
+    (for-each x *buffers*
+      (setf lines (cons (string-concat (if (dget x 'modified) "*" " ") " " (fit-width (dget x 'name) 24) " "
+                                       (fit-width (mode-pretty (dget x 'major)) 12) " " (or (dget x 'file) "")) lines)))
+    (show-help-buffer "*Buffer List*" (string-concat "MR Buffer                   Mode         File\n-- ------                   ----         ----\n" (join-lines (reverse lines))))))
+
+(defcommand save-buffers-kill-terminal () "Exit limacs."
+  (let ((dirty ()))
+    (for-each b *buffers* (when (and (dget b 'modified) (dget b 'file)) (setf dirty (cons (dget b 'name) dirty))))
+    (when (or (not dirty)
+              (y-or-n-p (string-concat "Modified buffers exist (" (string-join* ", " dirty) "); exit anyway? ")))
+      (setf *running* ()))))
+
+(defcommand revert-buffer () "Re-read the file from disk."
+  (when (bf file)
+    (when (or (not (bf modified)) (y-or-n-p "Discard changes? "))
+      (let ((pt (point))) (load-file-into-buffer (bf file)) (set-point pt) (message "Reverted")))))
+
+(defcommand insert-file () "Insert a file's contents at point."
+  (let ((path (read-minibuffer "Insert file: " (default-directory) file-completions 'file)))
+    (insert (let ((d (read-file-contents (expand-file-name path)))) (if (str-suffix-p "\n" d) (substr d 0 (- (slen d) 1)) d)))))
+
+(defcommand load-file () "Load a limo file into the running editor."
+  (let ((path (read-minibuffer "Load file: " (default-directory) file-completions 'file)))
+    (load (expand-file-name path)) (message "Loaded %s" path)))

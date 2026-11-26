@@ -1,0 +1,159 @@
+;; -*- limo -*-
+;; limacs/lib/async.limo --- syntax scanning in a background thread.
+;;
+;; The UI thread never has to wait for a scanner:
+;;
+;;   * rendering uses cached spans (`line-spans-view`); lines that have not
+;;     been scanned yet are drawn plain for a moment,
+;;   * after each frame `syn-plan` looks at the visible lines (plus a screenful
+;;     of look-ahead) and, if some are not cached, hands the worker a job:
+;;     a *snapshot* of the lines and the scanner state they start in,
+;;   * the worker thread runs the mode's :scan-line function over the snapshot
+;;     and posts (spans . end-state) for every line to a result queue,
+;;   * the UI thread merges results (`syn-poll`) while it waits for keys, but
+;;     only if nothing was edited in the meantime (`*syn-epoch*` unchanged),
+;;     then redraws.
+;;
+;; The worker only touches immutable strings and the scan function; the one
+;; shared global scanners use (*scan-line-no*) is guarded by *scan-mutex*.
+;; Indentation and the other commands that need exact answers right now keep
+;; using the synchronous `line-state`/`line-spans` from syntax.limo.
+
+(setq *syntax-async* ())          ; on/off (limacs-main turns it on when threads are available)
+(setq *syn-thread* ())
+(setq *syn-jobs* ())
+(setq *syn-results* ())
+(setq *syn-pending* 0)            ; jobs handed to the worker and not yet answered
+(setq *syn-chunk* 250)            ; lines per job: results show up progressively
+
+;;; ------------------------------------------------------------------
+;;; worker thread
+
+(defun syn-run-job (job)           ; job = (buffer epoch start state scan lines spans-from skip-fn)
+  ;; lines before SPANS-FROM are off screen: only their end state is needed,
+  ;; which the mode's :skip-regex lets us get without scanning most of them
+  (let ((epoch (nth 1 job)) (i (nth 2 job)) (st (nth 3 job)) (scan (nth 4 job))
+        (from (nth 6 job)) (skipf (nth 7 job)) (out ()) (ok :t))
+    (for-each text (nth 5 job)
+      (when ok
+        (cond ((not (= epoch *syn-epoch*)) (setf ok ()))          ; buffer changed: give up early
+              (:else (let* ((rx (if (and skipf (< i from)) (skipf st) ()))
+                            (r (if (and rx (not (re-test rx text)))
+                                   (cons 'none st)
+                                   (scan-locked scan text st i))))
+                       (setf out (cons r out))
+                       (setf st (cdr r))
+                       (setf i (+ i 1)))))))
+    (list (nth 0 job) epoch (nth 2 job) (reverse out) ok)))
+
+(defun syn-worker ()
+  (try (let ((j [*syn-jobs* get]))
+         (while (not (eq j 'quit))
+           [*syn-results* put (syn-run-job j)]
+           (setf j [*syn-jobs* get])))
+       [*syn-results* put (list () 0 0 () 'error (describe-error _exception))]))
+
+(defun syn-start ()
+  (unless *syn-thread*
+    (setf *syn-jobs* (new queue-lock))
+    (setf *syn-results* (new queue-lock))
+    (setf *scan-mutex* (new mutex))
+    (setf *syn-thread* (new thread syn-worker))
+    [*syn-thread* run]))
+
+(defun syn-stop ()
+  (when *syn-thread*
+    [*syn-jobs* put 'quit]
+    (setf *syn-thread* ())))
+
+;;; ------------------------------------------------------------------
+;;; UI side
+
+(defun syn-line-good-p (n)          ; is the cached result for line N exact?
+  (let ((key (vector-ref (bf spans-key) n)))
+    (if (and (< n (bf valid)) key)
+        (if (eq (car key) (buf-line n))
+            (let ((a (cdr key)) (b (vector-ref (bf states) n))) (if (eq a b) :t (deepeq a b)))
+            ())
+        ())))
+
+(defun line-spans-view (n)          ; spans for drawing line N; never waits for the worker
+  (cond ((syn-line-good-p n) (vector-ref (bf spans) n))      ; the common case, and cheap
+        ((not *syntax-async*) (line-spans n))
+        ((not (buffer-prop ':scan-line)) ())
+        (:else
+         (ensure-syntax-capacity)
+         (let ((key (vector-ref (bf spans-key) n)))
+           (cond ((syn-line-good-p n) (vector-ref (bf spans) n))
+                 ;; same text as when it was last scanned: right unless a multi-line
+                 ;; construct changed above it; the worker corrects that shortly
+                 ((and key (eq (car key) (buf-line n))) (vector-ref (bf spans) n))
+                 ;; edited line whose start state is known: one cheap exact scan
+                 ((< n (bf valid)) (line-spans n))
+                 (:else ()))))))
+
+(setq *plan-key* ())                ; what the screen looked like when the last plan found nothing to do
+(defun syn-plan ()                  ; after drawing: ask the worker for whatever is missing
+  (when (and *syntax-async* (= *syn-pending* 0)
+             (not (let ((k (list (bf name) *syn-epoch* *spans-version* (bf top) (bf valid) *rows*)))
+                    (if (and *plan-key* (deepeq k *plan-key*)) :t (progn (setf *plan-key* k) ()))))
+             (buffer-prop ':scan-line))
+    (ensure-syntax-capacity)
+    (let* ((h (text-height)) (nl (buf-nlines))
+           (end (imin nl (+ (bf top) h h))) (n (bf top)) (bad ()))
+      (while (and (not bad) (< n end))
+        (unless (syn-line-good-p n) (setf bad n))
+        (setf n (+ n 1)))
+      (when bad
+        (when (= (bf valid) 0)
+          (vector-set (bf states) 0 (buffer-prop ':init-state))
+          (bf! valid 1))
+        (let* ((s (imin bad (- (bf valid) 1))) (e (imin end (+ s (if (> bad s) 3000 *syn-chunk*)))))
+          (syn-start)
+          [*syn-jobs* put (list *cb* *syn-epoch* s (vector-ref (bf states) s)
+                                (buffer-prop ':scan-line) (buf-lines-list s e)
+                                bad (buffer-prop ':skip-regex))]
+          (setf *syn-pending* (+ *syn-pending* 1)))))))
+
+(defun syn-merge (b start results)
+  (setf *spans-version* (+ *spans-version* 1))
+  (with-buffer b
+    (ensure-syntax-capacity)
+    (let ((i start) (st-in (vector-ref (bf states) start)) (nl (buf-nlines)))
+      (for-each r results
+        (when (< i nl)
+          (unless (eq (car r) 'none)
+            (vector-set (bf spans) i (car r))
+            (vector-set (bf spans-key) i (cons (buf-line i) st-in)))
+          (vector-set (bf states) (+ i 1) (cdr r))
+          (setf st-in (cdr r))
+          (setf i (+ i 1))))
+      (when (> (+ i 1) (bf valid)) (bf! valid (+ i 1))))))
+
+(defun syn-poll ()                  ; merge finished jobs; :t if the display may have changed
+  (let ((changed ()) (r ()))
+    (when *syn-results*
+      (while (not (eq (setf r [*syn-results* get-or-end-or-nothing 'end 'nothing]) 'nothing))
+        (setf *syn-pending* (imax 0 (- *syn-pending* 1)))
+        (cond ((eq (nth 4 r) 'error)
+               (setf *syntax-async* ())
+               (setf *message* (string-concat "Syntax thread failed, back to synchronous scanning: " (nth 5 r))))
+              ((and (nth 4 r) (= (nth 1 r) *syn-epoch*) (member (car r) *buffers*))
+               (syn-merge (car r) (nth 2 r) (nth 3 r))
+               (setf changed :t)))))
+    changed))
+
+(defun syn-wait-idle ()             ; (tests) block until the worker has caught up
+  (let ((n 0))
+    (ensure-point-visible)
+    (syn-plan)
+    (while (and (> *syn-pending* 0) (< n 12000))
+      (sleep 1/200)
+      (syn-poll)
+      (syn-plan)
+      (setf n (+ n 1)))))
+
+(defcommand toggle-async-syntax () "Toggle highlighting in a background thread."
+  (cond (*syntax-async* (setf *syntax-async* ()) (message "Synchronous syntax scanning"))
+        (*threads-ok* (setf *syntax-async* :t) (message "Background syntax scanning"))
+        (:else (message "Threads are not available"))))

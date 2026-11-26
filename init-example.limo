@@ -1,0 +1,36 @@
+;;; Example ~/.limacs.limo -- user configuration for limacs.
+;;; Mode props are evaluated, so define functions BEFORE the mode that uses them.
+
+;; --- a minor mode: highlight TODO/FIXME anywhere (overlay = (line start end face))
+(defun todo-overlays (from to)
+  (let ((res ()))
+    (for-each l (mdrange from (imin to (buf-nlines)))
+      (let* ((s (buf-line l)) (m (re-match "^(.*?)(TODO|FIXME)" s 3)))
+        (when m (setf res (cons (list l (slen (cadr m)) (+ (slen (cadr m)) (slen (caddr m))) 'error) res)))))
+    res))
+(define-minor-mode todo-mode "Todo" :overlays todo-overlays)
+
+;; --- a major mode for .ini files, with a line scanner (spans = (start end face))
+(defun ini-scan-line (line state)
+  (cond ((re-test "^ *[;#]" line) (cons (list (list 0 (slen line) 'comment)) state))
+        ((re-test "^\\[" line)    (cons (list (list 0 (slen line) 'keyword)) state))
+        (:else (cons () state))))
+(define-major-mode ini-mode text-mode "INI"
+  :scan-line ini-scan-line
+  :comment-start "; ")
+(add-auto-mode "\\.ini$" 'ini-mode)
+
+;; --- an input method: rules are (keys . output)
+(define-input-method "arrows" "-> → <- ← => ⇒"
+  '(("->" . "→") ("<-" . "←") ("=>" . "⇒")))
+
+;; --- key bindings & preferences
+(define-key *global-map* "C-c t" 'todo-mode)
+(enable-minor-mode 'display-line-numbers-mode)
+
+;; --- a keyboard macro defined in code (record one, then M-x insert-kbd-macro prints this form)
+(define-kmacro 'bullet-line "C-a - SPC C-n" "C-c b")
+
+;; --- a custom colour theme: start from the dark one and change a few faces
+(define-theme 'my-theme '((keyword . "1;38;5;75") (comment . "3;38;5;102") (string . "38;5;150")))
+;; (load-theme 'my-theme)     ; M-x load-theme offers it too

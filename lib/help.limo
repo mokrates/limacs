@@ -1,0 +1,103 @@
+;; -*- limo -*-
+;; limacs/lib/help.limo --- describe-key, describe-mode, describe-bindings ...
+
+(define-major-mode help-mode () "Help")
+(define-key help-mode-map "q" 'quit-help)
+
+(setq *help-return* ())
+(defun show-help-buffer (name text)
+  (let ((prev *cb*) (b (get-buffer-create name)))
+    (unless (eq prev b) (setf *help-return* prev))
+    (set-buffer b)
+    (bf! readonly ())
+    (erase-buffer)
+    (insert text)
+    (bf! pt (cons 0 0)) (bf! top 0)
+    (set-major-mode 'help-mode)
+    (bf! readonly :t) (bf! modified ())
+    (bf! undo ())))
+(defcommand quit-help () "Leave the help buffer."
+  (let ((b *cb*))
+    (when (and *help-return* (memq-buffer *help-return*)) (set-buffer *help-return*))
+    (kill-buffer-object b)))
+(defun memq-buffer (b) (member b *buffers*))
+
+(defun key-label (evs)
+  (string-join* " " (map1 (lambda (e) e) evs)))
+
+(defun keymap-bindings (map prefix)                    ; -> list of (keys . command)
+  (let ((res ()))
+    (for-each p (dict-to-list map)
+      (let ((k (car p)) (b (cdr p)))
+        (unless (eq k "%parent")
+          (let ((keys (if (eq prefix "") k (string-concat prefix " " k))))
+            (cond ((keymap-p b) (setf res (append res (keymap-bindings b keys))))
+                  (b (setf res (append res (list (cons keys b))))))))))
+    (sort (lambda (a b) (string< (car a) (car b))) res)))
+(defun binding-name (b) (if (symbolp b) (str-downcase (symbol-to-string b)) "<lambda>"))
+
+(defcommand describe-key () "Show what a key sequence does."
+  (let ((evs ()) (b ()) (done ()))
+    (message "Describe key: ")
+    (while (not done)
+      (let ((e (read-event)))
+        (setf evs (append evs (list e)))
+        (let ((r (lookup-active evs)))
+          (cond ((keymap-p r) (message "Describe key: %s" (key-label evs)))
+                (r (setf b r) (setf done :t))
+                ((and (not (cdr evs)) (printable-key-p e)) (setf b 'self-insert-command) (setf done :t))
+                (:else (setf done :t))))))
+    (if b
+        (let ((doc (if (symbolp b) (dget *command-docs* b) "")))
+          (message "%s runs the command %s  --  %s" (key-label evs) (binding-name b) (or doc "")))
+        (message "%s is undefined" (key-label evs)))))
+
+(defcommand describe-function () "Show the documentation of a command."
+  (let* ((name (read-minibuffer "Describe function: " "" (command-names) 'mx)) (c (find-command name)))
+    (if c (message "%s: %s" name (or (dget *command-docs* c) "(undocumented)"))
+        (user-error "%s is not a command" name))))
+
+(defcommand describe-mode () "Describe the major and minor modes of this buffer."
+  (let ((out ()) (buf *cb*))
+    (defun add (s) (setf out (cons s out)))
+    (add (string-concat "Major mode: " (mode-pretty (bf major)) "   (" (string-join* " < " (map1 (lambda (m) (str-downcase (symbol-to-string m))) (mode-chain (bf major)))) ")\n"))
+    (add "Properties controlled by this mode:\n")
+    (for-each k '(:scan-line :indent-line :electric-chars :format-buffer :newline :input-method :input-method-context :comment-start :pairs :fill-prefix)
+      (let ((v (buffer-prop k)))
+        (when v (add (string-concat "  " (str-downcase (symbol-to-string k)) " = "
+                                    (cond ((stringp v) (repr v)) ((symbolp v) (str-downcase (symbol-to-string v)))
+                                          ((consp v) (repr v)) (:else "<function>")) "\n")))))
+    (add (string-concat "\nActive minor modes: " (string-join* ", " (map1 mode-pretty (active-minors))) "\n"))
+    (add (string-concat "Input method: " (or (bf im) "none") "\n"))
+    (add "\nMode-specific key bindings:\n")
+    (for-each m (mode-chain (bf major))
+      (for-each kb (keymap-bindings (dget (find-mode m) 'keymap) "")
+        (add (string-concat "  " (fit-width (car kb) 18) (binding-name (cdr kb)) "\n"))))
+    (show-help-buffer "*Help*" (list-to-string (reverse out)))))
+
+(defcommand describe-bindings () "List all key bindings."
+  (let ((out ()))
+    (for-each kb (append (keymap-bindings (car (reverse (active-keymaps))) "")
+                         (let ((r ())) (for-each m (butlast-maps (active-keymaps)) (setf r (append r (keymap-bindings m "")))) r))
+      (setf out (cons (string-concat (fit-width (car kb) 20) (binding-name (cdr kb)) "\n") out)))
+    (show-help-buffer "*Help*" (string-concat "Key bindings (global map last)\n\n" (list-to-string (reverse out))))))
+(defun butlast-maps (l) (if (not (cdr l)) () (cons (car l) (butlast-maps (cdr l)))))
+
+(defcommand view-limacs-tutorial () "Show a short introduction."
+  (show-help-buffer "*Help*"
+"limacs -- an Emacs-like editor written in limo
+===============================================
+
+Movement   C-f C-b C-n C-p  C-a C-e  M-f M-b  M-< M->  C-v M-v  M-g g
+Editing    C-d DEL  C-k  M-d  C-w M-w C-y M-y  C-/ undo  M-_ redo  C-SPC mark
+Files      C-x C-f  C-x C-s  C-x C-w  C-x b  C-x k  C-x C-c
+Search     C-s C-r  M-%  (query-replace)
+Modes      TAB indents  RET indents  M-x format-buffer  M-; comments
+Input      C-\\ toggles the input method;  M-x set-input-method
+Help       C-h k key   C-h f command   C-h m mode   C-h b bindings
+Eval       M-: expression   C-x C-e (eval last sexp in limo buffers)
+Extend     put limo code in ~/.limacs.limo -- see limacs/init-example.limo
+           M-x define-major-mode ... all of it is plain limo.
+
+Press q to leave this buffer.
+"))

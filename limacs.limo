@@ -1,0 +1,73 @@
+;; -*- limo -*-
+;; limacs --- an Emacs-like editor written in limo.
+;;
+;; Start with ./limacs [file ...]  (see the launcher script), or load this
+;; file from limo after setting *limacs-dir*.
+
+(unless (try *limacs-dir* ()) (setq *limacs-dir* "./"))
+;; threads are optional: without them everything is scanned synchronously
+(setq *threads-ok* (try (progn (import "threading.limo") :t) ()))
+(defmacro limacs-load (rel) `(load (string-concat *limacs-dir* ,rel)))
+
+(limacs-load "lib/util.limo")
+(limacs-load "lib/buffer.limo")
+(limacs-load "lib/modes.limo")
+(limacs-load "lib/syntax.limo")
+(limacs-load "lib/display.limo")
+(limacs-load "lib/term.limo")
+(limacs-load "lib/async.limo")
+(limacs-load "lib/commands.limo")
+(limacs-load "lib/edit.limo")
+(limacs-load "lib/minibuffer.limo")
+(limacs-load "lib/search.limo")
+(limacs-load "lib/files.limo")
+(limacs-load "lib/help.limo")
+(limacs-load "lib/sexp.limo")
+(limacs-load "lib/input-method.limo")
+(limacs-load "lib/loop.limo")
+(limacs-load "lib/kmacro.limo")
+(limacs-load "modes/limo.limo")
+(limacs-load "modes/c.limo")
+(limacs-load "modes/markdown.limo")
+(limacs-load "modes/dired.limo")
+
+(add-auto-mode "\\.(c|h|cc|cpp|hpp|cxx)$" 'c-mode)
+(add-auto-mode "\\.(limo|lisp|scm|el)$" 'limo-mode)
+(add-auto-mode "\\.(md|markdown)$" 'markdown-mode)
+
+(setq *init-fn* ())
+(defun limacs-init-buffers (files)
+  (let ((s (create-buffer "*scratch*")))
+    (set-buffer s)
+    (set-major-mode 'limo-mode)
+    (insert ";; This is the *scratch* buffer.  Type limo code and press C-x C-e\n;; after an expression to evaluate it; C-h t shows a short tutorial.\n\n")
+    (bf! modified ()) (bf! undo ()))
+  (when *init-fn* (*init-fn*))
+  (for-each f files
+    (try (visit-file f) (setf *message* (describe-error _exception)))))
+
+(defun limacs-load-user-init ()
+  (let ((home (env-var "HOME")))
+    (when home
+      (let ((path (string-concat home "/.limacs.limo")))
+        (when (file-exists-p path)
+          (try (load path) (setf *message* (string-concat "init error: " (describe-error _exception)))))))))
+
+(defun limacs-main (files)
+  (setf *init-fn* limacs-load-user-init)
+  (setf *syntax-async* (if (and *threads-ok* (not (env-var "LIMACS_SYNC"))) :t ()))
+  (limacs-init-buffers files)
+  (term-init)
+  (finally (try (command-loop) (if (eq _exception 'test-eof) () _rethrow))
+           (term-exit)))
+
+;; Headless driver used by the tests:  (limacs-test "files" "keys")
+(defun limacs-test (keys . files)
+  (setf *term-kind* 'test)
+  (setf *syntax-async* (if (and *threads-ok* (env-var "LIMACS_ASYNC")) :t ()))
+  (setf *test-keys* (keys->events keys))
+  (setf *init-fn* limacs-load-user-init-test)
+  (limacs-init-buffers (if files (car files) ()))
+  (try (command-loop) (if (eq _exception 'test-eof) () _rethrow)))
+(setq *test-init* ())
+(defun limacs-load-user-init-test () (when *test-init* (load *test-init*)))

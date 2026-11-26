@@ -1,0 +1,123 @@
+;; -*- limo -*-
+;; limacs/lib/minibuffer.limo --- reading strings and answers from the echo area.
+
+(setq *mb-hint* "")
+(setq *mb-history* (make-dict))
+
+(defun common-prefix (strs)
+  (if (not strs) ""
+      (let ((p (car strs)))
+        (for-each s (cdr strs)
+          (let ((i 0) (n (imin (slen p) (slen s))))
+            (while (and (< i n) (eq (sref p i) (sref s i))) (setf i (+ i 1)))
+            ;; don't cut a UTF-8 char in half
+            (while (and (> i 0) (< i (slen p)) (u8-cont-p p i)) (setf i (- i 1)))
+            (setf p (substr p 0 i))))
+        p)))
+
+(defun completion-candidates (completer text)
+  (cond ((not completer) ())
+        ((consp completer) (filter (lambda (s) (str-prefix-p text s)) completer))
+        (:else (completer text))))
+
+(defun mb-update (prompt text cur) (setf *mb-active* (list prompt text cur)))
+
+(defun read-minibuffer (prompt initial completer . hist-kind)
+  (let ((text initial) (cur (slen initial)) (done ()) (result ())
+        (hk (if hist-kind (car hist-kind) 'default)) (hidx -1) (saved ""))
+    (defun hprev ()
+      (let ((h (dget *mb-history* hk)))
+        (when (< (+ hidx 1) (list-length h))
+          (when (= hidx -1) (setf saved text))
+          (setf hidx (+ hidx 1)) (setf text (nth hidx h)) (setf cur (slen text)))))
+    (defun hnext ()
+      (let ((h (dget *mb-history* hk)))
+        (when (> hidx -1)
+          (setf hidx (- hidx 1))
+          (setf text (if (= hidx -1) saved (nth hidx h))) (setf cur (slen text)))))
+    (mb-update prompt text cur)
+    (finally
+     (progn
+       (while (not done)
+         (let ((e (read-event)))
+           (setf *mb-hint* "")
+           (cond ((eq e "RET") (setf result text) (setf done :t))
+                 ((eq e "C-g") (throw 'quit))
+                 ((eq e "TAB")
+                  (let ((cands (completion-candidates completer text)))
+                    (cond ((not cands) (setf *mb-hint* (if completer "  [No match]" "")))
+                          (:else
+                           (let ((cp (common-prefix cands)))
+                             (when (> (slen cp) (slen text)) (setf text cp) (setf cur (slen text)))
+                             (cond ((not (cdr cands)) (setf *mb-hint* "  [Sole completion]"))
+                                   (:else (setf *mb-hint* (string-concat "  {" (string-join* " " (take 12 (map1 mb-short-name cands))) (if (> (list-length cands) 12) " ..." "") "}")))))))))
+                 ((member e '("DEL" "C-h"))
+                  (when (> cur 0) (let ((p (u8-prev text cur))) (setf text (string-concat (substr text 0 p) (substr-from text cur))) (setf cur p))))
+                 ((member e '("C-d" "<delete>"))
+                  (when (< cur (slen text)) (setf text (string-concat (substr text 0 cur) (substr-from text (u8-next text cur))))))
+                 ((member e '("C-b" "<left>")) (when (> cur 0) (setf cur (u8-prev text cur))))
+                 ((member e '("C-f" "<right>")) (when (< cur (slen text)) (setf cur (u8-next text cur))))
+                 ((member e '("C-a" "<home>")) (setf cur 0))
+                 ((member e '("C-e" "<end>")) (setf cur (slen text)))
+                 ((eq e "C-k") (setf text (substr text 0 cur)))
+                 ((eq e "C-y") (when *kill-ring* (setf text (string-concat (substr text 0 cur) (car *kill-ring*) (substr-from text cur))) (setf cur (+ cur (slen (car *kill-ring*))))))
+                 ((eq e "<up>") (hprev))
+                 ((eq e "<down>") (hnext))
+                 ((eq e "ESC")                       ; M-p / M-n arrive as ESC p / ESC n
+                  (let ((k (read-event)))
+                    (cond ((eq k "p") (hprev))
+                          ((eq k "n") (hnext))
+                          ((eq k "ESC") (throw 'quit))
+                          (:else ()))))
+                 ((eq e "C-q") (let ((k (read-event))) (setf text (string-concat (substr text 0 cur) (key->char k) (substr-from text cur))) (setf cur (+ cur (slen (key->char k))))))
+                 ((printable-key-p e)
+                  (let ((ch (key->char e))) (setf text (string-concat (substr text 0 cur) ch (substr-from text cur))) (setf cur (+ cur (slen ch)))))
+                 (:else ()))
+           (mb-update prompt text cur)))
+       (when (and result (> (slen result) 0))
+         (dput *mb-history* hk (cons result (remove-item result (dget *mb-history* hk))))))
+     (progn (setf *mb-active* ()) (setf *mb-hint* "")))
+    result))
+
+(defun mb-short-name (s)                               ; show only the last path element
+  (let ((i (str-rindex s "/" (if (str-suffix-p "/" s) (- (slen s) 1) (slen s)))))
+    (if i (substr-from s (+ i 1)) s)))
+
+(defun y-or-n-p (prompt)
+  (let ((res ()) (done ()))
+    (mb-update (string-concat prompt "(y or n) ") "" 0)
+    (finally
+     (while (not done)
+       (let ((e (read-event)))
+         (cond ((member e '("y" "Y" "SPC")) (setf res :t) (setf done :t))
+               ((member e '("n" "N" "DEL")) (setf done :t))
+               ((eq e "C-g") (throw 'quit))
+               (:else ()))))
+     (setf *mb-active* ()))
+    res))
+
+(defun completing-read (prompt choices . initial)
+  (read-minibuffer prompt (if initial (car initial) "") choices))
+
+;;; ------------------------------------------------------------------
+;;; M-x and eval-expression
+
+(defcommand execute-extended-command () "Read a command name and run it."
+  (let* ((prefix *prefix-arg*) (name (read-minibuffer "M-x " "" (command-names) 'mx)) (cmd (find-command name)))
+    (cond ((not cmd) (user-error "No command named %s" name))
+          (:else (setf *prefix-arg* prefix) (setf *this-command* cmd) ((dget *commands* cmd))))))
+
+(defun eval-string (s)
+  (let ((forms (read-all-forms s)) (res ()))
+    (for-each f forms (setf res (eval f *genv*)))
+    res))
+(defun read-all-forms (s)
+  (let ((res ()) (rest s))
+    ;; read-string returns one form; wrap in a progn-like reader by reading "(progn ...)"
+    (cdr (read-string (string-concat "(progn " s "\n)")))))
+(defun print-value (v)
+  (cond ((stringp v) (repr v)) ((not v) "nil") ((or (numberp v) (symbolp v) (consp v)) (repr v)) (:else "#<object>")))
+
+(defcommand eval-expression () "Evaluate a limo expression and show the result."
+  (let ((s (read-minibuffer "Eval: " "" () 'eval)))
+    (message "%s" (print-value (eval-string s)))))

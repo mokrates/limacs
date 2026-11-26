@@ -1,0 +1,258 @@
+;; -*- limo -*-
+;; limacs/lib/edit.limo --- insertion, indentation, formatting, filling.
+
+(defun key->char (k) (if (eq k "SPC") " " k))
+(defun printable-key-p (k)
+  (or (eq k "SPC")
+      (and (= (u8-length k) 1) (>= (bref k 0) 32) (not (= (bref k 0) 127)))))
+
+;;; ------------------------------------------------------------------
+;;; indentation dispatch -- the mode decides how to indent
+
+(defun default-indent-line ()                      ; like indent-relative: copy previous nonblank line
+  (let ((l (point-line)) (ind 0))
+    (let ((k (- l 1)))
+      (while (and (>= k 0) (blank-p (buf-line k))) (setf k (- k 1)))
+      (when (>= k 0) (setf ind (line-indentation k))))
+    (set-line-indentation l ind)))
+
+(defun indent-current-line ()
+  (let ((f (buffer-prop ':indent-line)))
+    (if f (f) (default-indent-line))))
+
+(defun electric-indent-p () (minor-mode-enabled-p 'electric-indent-mode))
+
+(defun indent-lines (a b)
+  (let ((saved (point)) (l a))
+    (while (<= l b)
+      (set-point (cons l 0))
+      (if (blank-p (buf-line l))
+          (when (> (slen (buf-line l)) 0) (delete-between (cons l 0) (cons l (slen (buf-line l)))))
+          (indent-current-line))
+      (setf l (+ l 1)))
+    (set-point (cons (car saved) (imin (cdr saved) (buf-line-length (car saved)))))))
+
+(defcommand indent-region () "Indent each nonblank line in the region."
+  (require-region)
+  (let* ((rb (region-bounds)) (f (buffer-prop ':indent-region)))
+    (if f (f (car (car rb)) (car (cdr rb))) (indent-lines (car (car rb)) (car (cdr rb))))
+    (deactivate-mark)))
+
+(defcommand indent-for-tab-command () "Indent the current line (or region); insert a tab stop if the mode has no rules."
+  (cond ((region-active-p) (indent-region))
+        ((buffer-prop ':indent-line)
+         (let* ((l (point-line)) (old (buf-line l)) (oldcol (point-col)) (ws (leading-ws-len old)))
+           (indent-current-line)
+           (when (<= oldcol ws) (set-point (cons l (leading-ws-len (buf-line l)))))))
+        (:else
+         (let* ((tw (imin 8 (var 'tab-width))) (col (display-col (current-line-text) (point-col) tw)))
+           (if (var 'indent-tabs-mode) (insert "\t") (insert (spaces (- tw (mod col tw)))))))))
+
+(defcommand indent-rigidly-right () "Indent the region or line by one tab stop."
+  (let* ((rb (if (region-active-p) (region-bounds) (cons (point) (point)))))
+    (for-each l (mdrange (car (car rb)) (+ 1 (car (cdr rb))))
+      (unless (blank-p (buf-line l)) (set-line-indentation l (+ (line-indentation l) (var 'tab-width)))))))
+
+;;; ------------------------------------------------------------------
+;;; electric pairs
+
+(setq *default-pairs* '(("(" . ")") ("[" . "]") ("{" . "}") ("\"" . "\"")))
+(defun current-pairs () (or (buffer-prop ':pairs) *default-pairs*))
+(defun pair-opener-p (ch) (let ((r ())) (for-each p (current-pairs) (when (eq (car p) ch) (setf r (cdr p)))) r))
+(defun pair-closer-p (ch) (let ((r ())) (for-each p (current-pairs) (when (eq (cdr p) ch) (setf r :t))) r))
+(defun pair-between-p (p)
+  (and (minor-mode-enabled-p 'electric-pair-mode)
+       (let ((b (char-before-pos p)) (a (char-at p)))
+         (and b a (not (eq a "\n")) (eq (pair-opener-p b) a)))))
+
+(defun electric-pair-handle (ch)
+  (and (minor-mode-enabled-p 'electric-pair-mode)
+       (let ((next (char-at (point))) (prev (char-before-pos (point))) (close (pair-opener-p ch)))
+         (cond ((and next (eq next ch) (pair-closer-p ch)) (set-point (next-pos (point))) :t)
+               (close
+                (let ((quote-like (eq close ch)))
+                  (cond ((and quote-like (or (and prev (not (eq prev "\n")) (word-char-p prev))
+                                             (in-face-p (point-line) (point-col) '(comment string))))
+                         ())
+                        ((and next (not (eq next "\n")) (word-char-p next)) ())
+                        (:else (insert ch) (let ((p (point))) (insert close) (set-point p)) :t))))
+               (:else ())))))
+
+;;; ------------------------------------------------------------------
+;;; self-insert
+
+(setq *self-insert-hook* ())
+
+(defun insert-char-plain (ch)
+  (when (and (minor-mode-enabled-p 'overwrite-mode) (< (point-col) (buf-line-length (point-line))))
+    (delete-between (point) (next-pos (point))))
+  (insert ch))
+
+(defun post-self-insert (ch)
+  (when (and (electric-indent-p) (member ch (buffer-prop ':electric-chars)))
+    (let* ((l (point-line)) (s (buf-line l)) (ws (leading-ws-len s)))
+      ;; only when the typed char is the first non-blank on the line (or the mode says so)
+      (when (or (<= (- (point-col) (slen ch)) ws) (buffer-prop ':electric-anywhere))
+        (indent-current-line))))
+  (when (and (eq ch " ") (minor-mode-enabled-p 'auto-fill-mode)) (do-auto-fill))
+  (run-hook 'post-self-insert-hook ch))
+
+(defun self-insert-1 (ch)
+  (cond ((and (bf im) (im-handle-char ch)) ())
+        ((electric-pair-handle ch) ())
+        (:else (insert-char-plain ch)))
+  (post-self-insert ch))
+
+(defcommand self-insert-command () "Insert the typed character."
+  (let ((n (prefix-n)) (ch (key->char *last-event*)))
+    (while (> n 0) (self-insert-1 ch) (setf n (- n 1)))))
+
+(defcommand quoted-insert () "Insert the next character literally."
+  (let ((k (read-event)))
+    (insert (cond ((eq k "TAB") "\t") ((eq k "RET") "\n") ((eq k "ESC") (chr 27))
+                  ((re-test "^C-[a-z]$" k) (chr (- (bref k 2) 96)))
+                  (:else (key->char k))))))
+
+;;; ------------------------------------------------------------------
+;;; newline
+
+(defun default-newline ()
+  (let ((l (point-line)) (c (point-col)))
+    ;; drop trailing whitespace the user left before the break
+    (let ((s (buf-line l)))
+      (when (and (electric-indent-p) (> c 0) (ws-char-p (sref s (- c 1))))
+        (let ((a c)) (while (and (> a 0) (ws-char-p (sref s (- a 1)))) (setf a (- a 1)))
+          (delete-between (cons l a) (cons l c)))))
+    (cond ((and (pair-between-p (point)) (opener-p (char-before-pos (point))) (electric-indent-p))
+           ;; RET between {} : open a line for the body, leave the closer on its own line
+           (insert "\n") (let ((p (point))) (insert "\n") (indent-current-line) (set-point p) (indent-current-line)))
+          (:else (insert "\n")
+                 (when (electric-indent-p) (indent-current-line))))))
+
+(defcommand newline () "Insert a newline; indent according to the mode."
+  (let ((n (prefix-n)) (f (buffer-prop ':newline)))
+    (while (> n 0) (if f (f) (default-newline)) (setf n (- n 1)))))
+(defcommand newline-and-indent () "Insert a newline and indent."
+  (insert "\n") (indent-current-line))
+
+;;; ------------------------------------------------------------------
+;;; auto-fill & fill-paragraph
+
+(defun fill-prefix-of (line)                          ; prefix for continuation lines
+  (let ((f (buffer-prop ':fill-prefix)))
+    (if f (cdr (f line)) (substr line 0 (leading-ws-len line)))))
+(defun fill-first-prefix-of (line)
+  (let ((f (buffer-prop ':fill-prefix)))
+    (if f (car (f line)) (substr line 0 (leading-ws-len line)))))
+
+(defun do-auto-fill ()
+  (let* ((l (point-line)) (s (buf-line l)) (tw (var 'tab-width)) (fc (var 'fill-column)))
+    (when (> (display-col s (point-col) tw) fc)
+      (let* ((limit (imin (byte-at-col s (+ fc 1) tw) (- (point-col) 1)))
+             (ind (slen (fill-first-prefix-of s))) (i limit) (brk ()))
+        (while (and (> i ind) (not brk))
+          (if (ws-char-p (sref s i)) (setf brk i) (setf i (- i 1))))
+        (when (and brk (> brk ind))
+          (let ((a brk) (b brk))
+            (while (and (> a 0) (ws-char-p (sref s (- a 1)))) (setf a (- a 1)))
+            (while (and (< b (slen s)) (ws-char-p (sref s b))) (setf b (+ b 1)))
+            (when (> a ind)
+              (let ((prefix (fill-prefix-of s)))
+                (delete-between (cons l a) (cons l b))
+                (insert-at (cons l a) (string-concat "\n" prefix))))))))))
+
+(defun paragraph-bounds (l)                            ; (first . last) line of paragraph at L
+  (let ((a l) (b l) (last (- (buf-nlines) 1)))
+    (while (and (> a 0) (not (blank-p (buf-line (- a 1)))) (not (paragraph-start-p (- a 1) a))) (setf a (- a 1)))
+    (while (and (< b last) (not (blank-p (buf-line (+ b 1)))) (not (paragraph-start-p b (+ b 1)))) (setf b (+ b 1)))
+    (cons a b)))
+(defun paragraph-start-p (prev l)                      ; does line L start a new paragraph?
+  (let ((f (buffer-prop ':paragraph-start))) (if f (f prev l) ())))
+
+(defcommand fill-paragraph () "Re-wrap the current paragraph to fill-column."
+  (let ((l (point-line)))
+    (when (blank-p (buf-line l)) (user-error "Not in a paragraph"))
+    (let* ((pb (paragraph-bounds l)) (a (car pb)) (b (cdr pb)) (fc (var 'fill-column))
+           (first-prefix (fill-first-prefix-of (buf-line a))) (rest-prefix (fill-prefix-of (buf-line a)))
+           (words ()))
+      (for-each k (mdrange a (+ b 1))
+        (let ((s (buf-line k)))
+          (let ((body (if (= k a) (substr-from s (slen first-prefix))
+                          (let ((r (fill-strip-prefix s rest-prefix))) r))))
+            (for-each w (split-by (str-trim body) " ") (when (> (slen w) 0) (setf words (cons w words)))))))
+      (setf words (reverse words))
+      (let ((lines ()) (cur first-prefix) (empty :t))
+        (for-each w words
+          (cond (empty (setf cur (string-concat cur w)) (setf empty ()))
+                ((<= (u8-length (string-concat cur " " w)) fc) (setf cur (string-concat cur " " w)))
+                (:else (setf lines (cons cur lines)) (setf cur (string-concat rest-prefix w)))))
+        (setf lines (reverse (cons cur lines)))
+        (let ((new (join-lines lines)))
+          (unless (eq new (buffer-substring (cons a 0) (line-end-pos b)))
+            (delete-between (cons a 0) (line-end-pos b))
+            (insert-at (cons a 0) new)))
+        (set-point (cons (+ a (- (list-length lines) 1)) 0))
+        (set-point (line-end-pos (point-line)))))))
+(defun fill-strip-prefix (s prefix)
+  (let ((ws (leading-ws-len s)))
+    (cond ((str-prefix-p prefix s) (substr-from s (slen prefix)))
+          (:else (substr-from s ws)))))
+
+;;; ------------------------------------------------------------------
+;;; formatting
+
+(defun default-format-buffer ()
+  (indent-lines 0 (- (buf-nlines) 1))
+  (trim-trailing-whitespace))
+
+(defun trim-trailing-whitespace ()
+  (let ((l 0) (pt (point)))
+    (while (< l (buf-nlines))
+      (let* ((s (buf-line l)) (e (trailing-ws-start s)))
+        (when (< e (slen s)) (delete-between (cons l e) (cons l (slen s)))))
+      (setf l (+ l 1)))
+    (set-point pt)))
+
+(defun ensure-final-newline ()
+  (let ((last (- (buf-nlines) 1)))
+    (when (> (buf-line-length last) 0) (insert-at (cons last (buf-line-length last)) "\n"))
+    ;; remove superfluous blank lines at the end
+    (let ((n (- (buf-nlines) 1)))
+      (while (and (> n 1) (blank-p (buf-line n)) (blank-p (buf-line (- n 1))))
+        (delete-between (cons (- n 1) 0) (cons n 0))
+        (setf n (- n 1))))))
+
+(defun format-buffer-1 ()
+  (let ((pt (point)))
+    (undo-boundary)
+    (let ((f (buffer-prop ':format-buffer))) (if f (f) (default-format-buffer)))
+    (when (var 'require-final-newline) (ensure-final-newline))
+    (set-point pt)))
+(defcommand format-buffer () "Reformat the whole buffer according to the major mode."
+  (format-buffer-1) (message "Formatted %s" (bf name)))
+
+;;; ------------------------------------------------------------------
+;;; comments
+
+(defcommand comment-dwim () "Comment or uncomment the region (or the current line)."
+  (let* ((cs (buffer-prop ':comment-start)) (ce (or (buffer-prop ':comment-end) "")))
+    (unless cs (user-error "No comment syntax defined for this mode"))
+    (let* ((rb (if (region-active-p) (region-bounds) (cons (point) (point))))
+           (a (car (car rb))) (b (car (cdr rb))) (cstr (str-trim-right cs)) (all-commented :t))
+      (when (and (region-active-p) (= (cdr (cdr rb)) 0) (> b a)) (setf b (- b 1)))
+      (for-each l (mdrange a (+ b 1))
+        (let ((s (buf-line l)))
+          (when (and (not (blank-p s)) (not (str-prefix-p cstr (substr-from s (leading-ws-len s)))))
+            (setf all-commented ()))))
+      (for-each l (mdrange a (+ b 1))
+        (let* ((s (buf-line l)) (ws (leading-ws-len s)))
+          (unless (blank-p s)
+            (cond (all-commented
+                   (let* ((body (substr-from s ws))
+                          (body1 (if (str-prefix-p cs body) (substr-from body (slen cs)) (substr-from body (slen cstr))))
+                          (body2 (if (and (> (slen ce) 0) (str-suffix-p (str-trim-right ce) (str-trim-right body1)))
+                                     (let ((t1 (str-trim-right body1))) (str-trim-right (substr t1 0 (- (slen t1) (slen (str-trim-right ce))))))
+                                     body1)))
+                     (replace-line l (string-concat (substr s 0 ws) body2))))
+                  (:else (replace-line l (string-concat (substr s 0 ws) cs (substr-from s ws) ce)))))))
+      (deactivate-mark))))

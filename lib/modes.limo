@@ -1,0 +1,259 @@
+;; -*- limo -*-
+;; limacs/lib/modes.limo --- keymaps, commands, faces and the mode system.
+;;
+;; MODES are what makes limacs programmable.  A mode is a dict of
+;; properties; major modes form an inheritance chain (derived modes),
+;; minor modes are toggled per buffer (or globally).  The editor core only
+;; ever asks the *buffer* for a property:
+;;
+;;     (buffer-prop :indent-line)      first non-nil value, minor modes first,
+;;                                     then the major mode and its parents
+;;     (buffer-props :overlays)        every value from every active mode
+;;
+;; Properties the core understands (all optional):
+;;   :scan-line        (fn line state) -> (spans . new-state)    syntax highlighting
+;;   :init-state       initial scanner state (default nil)
+;;   :skip-regex       (fn state) -> regex; a line not matching it leaves STATE unchanged
+;;   :indent-line      (fn) reindent the current line            auto indentation
+;;   :electric-chars   list of chars that reindent the line when typed
+;;   :indent-region    (fn start-line end-line)
+;;   :format-buffer    (fn)                                      auto formatting
+;;   :newline          (fn) what RET does                        (e.g. list continuation)
+;;   :overlays         (fn) -> list of (line start end face)     extra highlighting
+;;   :input-method     name of an input method to switch on
+;;   :input-method-context (fn) -> true if input method may act at point
+;;   :pairs            alist of electric pairs
+;;   :comment-start / :comment-end                               M-;
+;;   :word-chars       extra word constituents
+;;   :vars             alist of buffer-local variables
+;;   :on / :off        called when the mode is switched on / off
+;;   :lighter          string shown in the mode line (minor modes)
+
+;;; ------------------------------------------------------------------
+;;; faces: face name -> SGR parameter string
+
+(setq *faces* (make-dict))
+(setq *face-gen* 0)                           ; bumped when a face changes: invalidates cached rows
+(defun define-face (name sgr) (setf *face-gen* (+ *face-gen* 1)) (dput *faces* name sgr))
+(defun face-sgr (name) (if name (dget *faces* name) ()))
+
+;;; ------------------------------------------------------------------
+;;; keymaps
+
+(defun make-keymap parent
+  (let ((m (make-dict)))
+    (when (and parent (car parent)) (dput m "%parent" (car parent)))
+    m))
+(defun keymap-p (x) (and (dictp x) :t))
+
+(defun kbd-parse (s)                       ; "C-x M-f RET" -> ("C-x" "ESC" "f" "RET")
+  (let ((res ()))
+    (for-each tok (split-by s " ")
+      (when (> (slen tok) 0)
+        (let ((t1 tok))
+          (while (and (> (slen t1) 2) (eq (substr t1 0 2) "M-"))
+            (setf res (cons "ESC" res))
+            (setf t1 (substr-from t1 2)))
+          (setf res (cons t1 res)))))
+    (reverse res)))
+
+(defun keymap-ref (map ev)
+  (cond ((dhas map ev) (dget map ev))
+        ((dhas map "%parent") (keymap-ref (dget map "%parent") ev))
+        (:else ())))
+
+(defun define-key (map keys binding)
+  (let ((evs (kbd-parse keys)) (m map))
+    (while (cdr evs)
+      (let ((sub (dget m (car evs))))
+        (unless (keymap-p sub)
+          (setf sub (make-keymap))
+          (dput m (car evs) sub))
+        (setf m sub)
+        (setf evs (cdr evs))))
+    (dput m (car evs) binding)
+    binding))
+
+(defun lookup-key (map evs)                 ; binding, a keymap (prefix) or nil
+  (let ((m map) (res ()) (done ()))
+    (while (and evs (not done))
+      (let ((b (keymap-ref m (car evs))))
+        (cond ((not (cdr evs)) (setf res b) (setf done :t))
+              ((keymap-p b) (setf m b) (setf evs (cdr evs)))
+              (:else (setf res ()) (setf done :t)))))
+    res))
+
+(setq *global-map* (make-keymap))
+(setq *minibuffer-map* (make-keymap))
+
+;;; ------------------------------------------------------------------
+;;; commands
+
+(setq *commands* (make-dict))       ; symbol -> function
+(setq *command-docs* (make-dict))
+(defun register-command (name fn doc) (dput *commands* name fn) (dput *command-docs* name doc) name)
+(defmacro defcommand (name args doc . body)
+  `(progn (defun ,name ,args ,@body)
+          (register-command ',name ,name ,doc)))
+(defun command-p (x) (and (symbolp x) (dhas *commands* x)))
+(defun command-names ()                      ; lowercase strings for completion
+  (sort string< (map1 (lambda (s) (str-downcase (symbol-to-string s))) (dkeys *commands*))))
+(defun find-command (str) (let ((s (make-sym (str-upcase str)))) (if (command-p s) s ())))
+
+;; prefix argument
+(setq *prefix-arg* ())
+(defun prefix-n () (cond ((not *prefix-arg*) 1) ((eq *prefix-arg* '-) -1) ((consp *prefix-arg*) (car *prefix-arg*)) (:else *prefix-arg*)))
+(defun prefix-raw () *prefix-arg*)
+
+;;; ------------------------------------------------------------------
+;;; modes
+
+(setq *modes* (make-dict))
+(setq *global-minors* ())
+
+(defun plist-pairs (pl)
+  (if (not pl) () (cons `(cons ',(car pl) ,(cadr pl)) (plist-pairs (cddr pl)))))
+
+(defun register-mode (name kind parent pretty props keymap)
+  (let ((m (make-dict)) (pd (make-dict)))
+    (for-each p props (dput pd (car p) (cdr p)))
+    (dput m 'name name) (dput m 'kind kind) (dput m 'parent parent)
+    (dput m 'pretty pretty) (dput m 'props pd) (dput m 'keymap keymap)
+    (dput *modes* name m)
+    name))
+(defun find-mode (name) (dget *modes* name))
+(defun mode-prop (name key)
+  (let ((m (find-mode name)))
+    (cond ((not m) ())
+          ((dhas (dget m 'props) key) (dget (dget m 'props) key))
+          ((dget m 'parent) (mode-prop (dget m 'parent) key))
+          (:else ()))))
+(defun mode-own-prop (name key) (let ((m (find-mode name))) (if m (dget (dget m 'props) key) ())))
+(defun mode-chain (name)                     ; (name parent grandparent ...)
+  (if (not name) () (cons name (mode-chain (dget (find-mode name) 'parent)))))
+(defun mode-pretty (name) (let ((m (find-mode name))) (if m (dget m 'pretty) "?")))
+(defun mode-hook-symbol (name) (make-sym (string-concat (symbol-to-string name) "-HOOK")))
+
+(defmacro define-major-mode (name parent pretty . plist)
+  (let ((mapsym (make-sym (string-concat (symbol-to-string name) "-MAP"))))
+    `(progn
+       (setq ,mapsym (make-keymap))
+       (register-mode ',name 'major ',parent ,pretty (list ,@(plist-pairs plist)) ,mapsym)
+       (register-command ',name (lambda () (set-major-mode ',name)) ,(string-concat "Switch to " pretty " mode."))
+       ',name)))
+
+(defmacro define-minor-mode (name lighter . plist)
+  (let ((mapsym (make-sym (string-concat (symbol-to-string name) "-MAP"))))
+    `(progn
+       (setq ,mapsym (make-keymap))
+       (register-mode ',name 'minor () ,lighter (list ,@(plist-pairs plist)) ,mapsym)
+       (register-command ',name (lambda () (toggle-minor-mode ',name))
+                         ,(string-concat "Toggle " lighter " minor mode."))
+       ',name)))
+
+;; per buffer state
+(defun buffer-major () (bf major))
+(defun minor-mode-global-p (name) (mode-own-prop name ':global))
+(defun active-minors ()                     ; newest first
+  (append (bf minors) (filter (lambda (m) (not (member m (bf minors)))) *global-minors*)))
+(defun minor-mode-enabled-p (name) (if (member name (active-minors)) :t ()))
+
+(defun buffer-prop (key)
+  (let ((res ()) (found ()))
+    (for-each m (active-minors)
+      (unless found
+        (let ((mm (find-mode m)))
+          (when (and mm (dhas (dget mm 'props) key))
+            (let ((v (dget (dget mm 'props) key))) (when v (setf res v) (setf found :t)))))))
+    (unless found
+      (for-each m (mode-chain (bf major))
+        (unless found
+          (let ((v (mode-own-prop m key))) (when v (setf res v) (setf found :t))))))
+    res))
+(defun buffer-props (key)                    ; all contributions
+  (let ((res ()))
+    (for-each m (active-minors)
+      (let ((v (mode-own-prop m key))) (when v (setf res (cons v res)))))
+    (for-each m (mode-chain (bf major))
+      (let ((v (mode-own-prop m key))) (when v (setf res (cons v res)))))
+    (reverse res)))
+
+(defun active-keymaps ()
+  (let ((res ()))
+    (for-each m (active-minors)
+      (let ((mm (find-mode m))) (when mm (setf res (cons (dget mm 'keymap) res)))))
+    (setf res (reverse res))
+    (for-each m (mode-chain (bf major))
+      (let ((mm (find-mode m))) (when mm (setf res (append res (list (dget mm 'keymap)))))))
+    (append res (list *global-map*))))
+
+(defun reset-syntax-cache ()
+  (syn-bump)
+  (setf *spans-version* (+ *spans-version* 1))
+  (bf! valid 0)
+  (bf! spans-key (make-vector (vector-len (bf spans-key)))))
+
+(defun apply-mode-vars (name)
+  (for-each m (reverse (mode-chain name))
+    (for-each p (mode-own-prop m ':vars) (set-var-local (car p) (cdr p)))))
+
+(defun refresh-mode-settings ()
+  (setf *word-extra* (or (buffer-prop ':word-chars) ""))
+  (reset-syntax-cache))
+
+(defun set-major-mode (name)
+  (when (not (find-mode name)) (throw (list 'no-such-mode name)))
+  (let ((old (bf major)))
+    (when old (let ((off (mode-own-prop old ':off))) (when off (off))))
+    (bf! major name)
+    (dict-to-list (bf locals))
+    (bf! locals (make-dict))
+    (apply-mode-vars name)
+    (refresh-mode-settings)
+    (for-each m (reverse (mode-chain name))
+      (let ((on (mode-own-prop m ':on))) (when on (on)))
+      (run-hook (mode-hook-symbol m)))
+    (let ((im (buffer-prop ':input-method)))
+      (when (and im (var 'input-method-auto)) (set-input-method im)))
+    (run-hook 'major-mode-hook)
+    name))
+
+(defun enable-minor-mode (name)
+  (unless (minor-mode-enabled-p name)
+    (if (minor-mode-global-p name)
+        (setf *global-minors* (cons name *global-minors*))
+        (bf! minors (cons name (bf minors))))
+    (apply-mode-vars-minor name)
+    (let ((on (mode-own-prop name ':on))) (when on (on)))
+    (refresh-mode-settings)
+    (run-hook (mode-hook-symbol name)))
+  :t)
+(defun apply-mode-vars-minor (name)
+  (for-each p (mode-own-prop name ':vars) (set-var-local (car p) (cdr p))))
+(defun disable-minor-mode (name)
+  (when (minor-mode-enabled-p name)
+    (let ((off (mode-own-prop name ':off))) (when off (off)))
+    (bf! minors (remove-item name (bf minors)))
+    (setf *global-minors* (remove-item name *global-minors*))
+    (refresh-mode-settings))
+  ())
+(defun toggle-minor-mode (name)
+  (if (minor-mode-enabled-p name)
+      (progn (disable-minor-mode name) (message "%s disabled" (mode-pretty name)))
+      (progn (enable-minor-mode name) (message "%s enabled" (mode-pretty name)))))
+
+;;; mode line text for the active modes
+(defun mode-line-modes ()
+  (let ((parts (list (mode-pretty (bf major)))))
+    (for-each m (reverse (active-minors))
+      (let ((l (mode-pretty m))) (when (and l (> (slen l) 0)) (setf parts (cons l parts)))))
+    (let ((im (bf im)))
+      (when im (setf parts (cons (string-concat "[" im "]") parts))))
+    (when *kmacro-recording* (setf parts (cons "Def" parts)))
+    (string-join* " " (reverse parts))))
+
+;;; message (echo area) -- real implementation lives in display.limo
+(setq *message* "")
+(defun message (fmt . args)
+  (setf *message* (apply format (cons fmt args)))
+  *message*)

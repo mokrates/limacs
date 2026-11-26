@@ -1,0 +1,11 @@
+#!/bin/bash
+# limacs launcher: ./limacs [files...]
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+LIMO="${LIMO:-limo}"
+ARGS=""
+for f in "$@"; do
+  f="${f//\\/\\\\}"; f="${f//\"/\\\"}"
+  ARGS="$ARGS \"$f\""
+done
+export ESCDELAY="${ESCDELAY:-25}"
+exec "$LIMO" -e "(setq *limacs-dir* \"$DIR/\")" -i "$DIR/limacs.limo" -e "(limacs-main (list $ARGS))" -e '(exit)'

@@ -1,0 +1,152 @@
+;; -*- limo -*-
+;; limacs/lib/loop.limo --- key dispatch, the command loop, global key bindings.
+
+(defun lookup-active (evs)                       ; command | keymap (prefix pending) | nil
+  (let ((res ()) (prefix ()))
+    (block found
+      (for-each m (active-keymaps)
+        (let ((b (lookup-key m evs)))
+          (cond ((keymap-p b) (setf prefix b))
+                (b (setf res b) (return-from found res))))))
+    (or res prefix)))
+
+(defun read-key-sequence ()
+  (let ((evs ()) (result ()) (done ()))
+    (while (not done)
+      (let ((e (read-event)))
+        (when (not evs) (setf *message* ""))
+        (setf evs (append evs (list e)))
+        (setf *last-event* e)
+        (let ((b (lookup-active evs)))
+          (cond ((keymap-p b) (setf *message* (string-concat (key-label evs) "-")))
+                (b (setf result b) (setf done :t) (when (cdr evs) (setf *message* "")))
+                ((and (not (cdr evs)) (printable-key-p e)) (setf result 'self-insert-command) (setf done :t))
+                ((eq e "<resize>") (term-force-redraw) (setf result 'redraw-display) (setf done :t))
+                (:else (setf result 'undefined) (setf done :t))))))
+    (cons evs result)))
+
+(defun describe-error (exc)
+  (cond ((eq exc 'quit) "Quit")
+        ((and (consp exc) (eq (car exc) 'user-error)) (cadr exc))
+        ((and (consp exc) (eq (car exc) 'buffer-read-only)) (string-concat "Buffer is read-only: " (cadr exc)))
+        ((and (consp exc) (eq (car exc) 'fatal)) (string-concat "Error: " (cadr exc)))
+        (:else (string-concat "Error: " (try (repr exc) "?")))))
+
+(defun call-command (cmd)
+  (try (if (symbolp cmd) ((dget *commands* cmd)) (cmd))
+       (cond ((eq _exception 'test-eof) _rethrow)
+             (:else (kmacro-abort)
+                    (setf *message* (describe-error _exception))
+                    (when (and (eq *term-kind* 'test) (not (eq _exception 'quit)))
+                      (print (string-concat "[error] " *message* "\n")))
+                    (when (eq _exception 'quit) (setf *prefix-arg* ()) (setf *pending-prefix* ()))
+                    ()))))
+
+(defcommand redraw-display () "Redraw the screen." (term-force-redraw))
+(defcommand undefined () "Key has no binding." ())
+
+(defun ed-step ()
+  (let* ((r (read-key-sequence)) (evs (car r)) (cmd (cdr r)) (tick0 (bf tick)))
+    (setf *kmacro-keep* (- *kmacro-count* (list-length evs)))
+    (setf *prefix-arg* *pending-prefix*)
+    (setf *pending-prefix* ())
+    (setf *this-command* cmd)
+    (unless (member cmd *vertical-commands*) (bf! goal ()))
+    (unless (and (eq cmd 'self-insert-command) (eq *last-command* 'self-insert-command)) (undo-boundary))
+    (unless (member cmd '(self-insert-command delete-backward-char)) (im-reset))
+    (if (eq cmd 'undefined)
+        (progn (kmacro-abort) (setf *message* (string-concat (key-label evs) " is undefined")))
+        (call-command cmd))
+    (when (and (not (= tick0 (bf tick))) (not (member cmd '(set-mark-command yank)))) (deactivate-mark))
+    (unless (eq cmd 'universal-argument) (unless *pending-prefix* (setf *prefix-arg* ())))
+    (run-hook 'post-command-hook)
+    (setf *last-command* *this-command*)))
+
+(defun command-loop ()
+  (while *running*
+    (try (ed-step)
+         (cond ((eq _exception 'test-eof) _rethrow)
+               (:else (setf *message* (describe-error _exception))
+                      (when (and (eq *term-kind* 'test) (not (eq _exception 'quit)))
+                        (print (string-concat "[error] " *message* "\n"))))))))
+
+;;; ------------------------------------------------------------------
+;;; global key bindings
+
+(defun bind-all (map alist) (for-each p alist (define-key map (car p) (cdr p))))
+
+(bind-all *global-map*
+  '(("C-f" . forward-char) ("C-b" . backward-char) ("C-n" . next-line) ("C-p" . previous-line)
+    ("<right>" . forward-char) ("<left>" . backward-char) ("<down>" . next-line) ("<up>" . previous-line)
+    ("C-a" . beginning-of-line) ("C-e" . end-of-line) ("<home>" . beginning-of-line) ("<end>" . end-of-line)
+    ("M-f" . forward-word) ("M-b" . backward-word) ("M-<" . beginning-of-buffer) ("M->" . end-of-buffer)
+    ("C-v" . scroll-up-command) ("M-v" . scroll-down-command) ("<next>" . scroll-up-command) ("<prior>" . scroll-down-command)
+    ("C-l" . recenter-top-bottom) ("M-g g" . goto-line) ("M-g M-g" . goto-line) ("M-m" . back-to-indentation)
+    ("M-}" . forward-paragraph) ("M-{" . backward-paragraph)
+    ("C-d" . delete-char) ("<delete>" . delete-char) ("DEL" . delete-backward-char) ("C-h" . help-prefix-dummy)
+    ("C-k" . kill-line) ("M-d" . kill-word) ("M-DEL" . backward-kill-word) ("C-w" . kill-region) ("M-w" . copy-region-as-kill)
+    ("C-y" . yank) ("M-y" . yank-pop) ("C-SPC" . set-mark-command) ("C-x C-x" . exchange-point-and-mark) ("C-x h" . mark-whole-buffer)
+    ("C-_" . undo) ("C-/" . undo) ("C-x u" . undo) ("M-_" . redo)
+    ("C-o" . open-line) ("C-t" . transpose-chars) ("M-t" . transpose-words)
+    ("M-u" . upcase-word) ("M-l" . downcase-word) ("M-c" . capitalize-word)
+    ("M-\\" . delete-horizontal-space) ("M-SPC" . just-one-space) ("M-^" . delete-indentation) ("C-x C-o" . delete-blank-lines)
+    ("RET" . newline) ("C-j" . newline-and-indent) ("TAB" . indent-for-tab-command) ("<backtab>" . indent-rigidly-right)
+    ("C-M-\\" . indent-region) ("M-;" . comment-dwim) ("M-q" . fill-paragraph) ("C-q" . quoted-insert)
+    ("C-u" . universal-argument) ("M--" . negative-argument) ("C-g" . keyboard-quit)
+    ("C-s" . isearch-forward) ("C-r" . isearch-backward) ("M-%" . query-replace)
+    ("C-x C-f" . find-file) ("C-x C-s" . save-buffer) ("C-x C-w" . write-file) ("C-x b" . switch-to-buffer)
+    ("C-x k" . kill-buffer) ("C-x C-b" . list-buffers) ("C-x C-c" . save-buffers-kill-terminal) ("C-x <right>" . next-buffer)
+    ("C-x C-v" . revert-buffer) ("C-x i" . insert-file)
+    ("M-x" . execute-extended-command) ("M-:" . eval-expression)
+    ("C-x C-e" . eval-last-sexp)
+    ("C-h k" . describe-key) ("C-h f" . describe-function) ("C-h m" . describe-mode) ("C-h b" . describe-bindings)
+    ("C-h t" . view-limacs-tutorial) ("<f1> k" . describe-key) ("<f1> m" . describe-mode)
+    ("C-\\" . toggle-input-method) ("C-x RET C-\\" . set-input-method)
+    ("C-x f" . format-buffer) ("C-c f" . format-buffer)
+    ("C-M-f" . forward-sexp) ("C-M-b" . backward-sexp) ("C-M-u" . backward-up-list) ("C-M-d" . down-list)
+    ("C-M-k" . kill-sexp) ("C-M-q" . indent-sexp)))
+(for-each d '("0" "1" "2" "3" "4" "5" "6" "7" "8" "9") (define-key *global-map* (string-concat "M-" d) 'digit-argument))
+(defcommand help-prefix-dummy () "C-h is the help prefix." (unread-event "C-h") ())
+(define-key *global-map* "C-h" (make-keymap))
+(bind-all (lookup-key *global-map* '("C-h"))
+  '(("k" . describe-key) ("f" . describe-function) ("m" . describe-mode) ("b" . describe-bindings) ("t" . view-limacs-tutorial)))
+
+;;; ------------------------------------------------------------------
+;;; basic modes
+
+(define-major-mode fundamental-mode () "Fundamental")
+(define-major-mode text-mode () "Text"
+  :vars '((tab-width . 4) (fill-column . 72)))
+(define-major-mode prog-mode () "Prog"
+  :vars '((tab-width . 4) (indent-tabs-mode . ())))
+
+(defun trailing-ws-overlays (from to)
+  (let ((res ()))
+    (for-each l (mdrange from (imin to (buf-nlines)))
+      (let* ((s (buf-line l)) (e (trailing-ws-start s)))
+        (when (and (< e (slen s)) (not (and (= l (point-line)) (= (point-col) (slen s)))))
+          (setf res (cons (list l e (slen s) 'trailing-ws) res)))))
+    res))
+(defun hl-line-overlays (from to)
+  (list (list (point-line) 0 (+ 1 (buf-line-length (point-line))) 'hl-line)))
+
+(defun show-paren-overlays (from to) (show-paren-compute))
+
+;;; global minor modes that provide the "auto" behaviours
+(define-minor-mode electric-indent-mode "ElecIndent" :global :t)
+(define-minor-mode electric-pair-mode "Pair" :global :t)
+(define-minor-mode auto-fill-mode "Fill")
+(define-minor-mode overwrite-mode "Ovwrt")
+(define-minor-mode display-line-numbers-mode "Lines" :global :t)
+(define-minor-mode format-on-save-mode "FmtSave")
+(define-minor-mode show-paren-mode "" :global :t :overlays show-paren-overlays)
+(define-minor-mode trailing-whitespace-mode "WS" :overlays trailing-ws-overlays)
+(define-minor-mode hl-line-mode "HL" :global :t :overlays hl-line-overlays)
+
+(add-hook 'before-save-hook
+  (lambda () (when (minor-mode-enabled-p 'format-on-save-mode) (format-buffer-1))))
+
+;; electric-indent, electric-pair and show-paren are on by default, like in Emacs.
+;; line numbers, hl-line are off until asked for.
+(setq *global-minors* '(electric-indent-mode electric-pair-mode show-paren-mode))
+

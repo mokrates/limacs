@@ -1,0 +1,262 @@
+;; -*- limo -*-
+;; limacs/lib/util.limo --- small helpers the rest of limacs is built on.
+;;
+;; Reminders about limo that shape this code:
+;;  * `if' always takes three arguments; use `when'/`unless'/`cond' otherwise.
+;;  * `setq' inside a lambda/while/for-each body creates a *local*;
+;;    to mutate an outer variable always use `setf'.
+;;  * strings are byte strings.  Columns in limacs are byte offsets; the
+;;    helpers below know about UTF-8 where it matters (cursor movement and
+;;    display width).
+
+(setq *genv* (env-current))   ; the global environment, for user eval
+(mod-load "vector")
+(mod-load "regex")
+
+;;; ------------------------------------------------------------------
+;;; numbers / lists
+
+(defun imax (a b) (if (> a b) a b))
+(defun imin (a b) (if (< a b) a b))
+(defun iabs (a) (if (< a 0) (- 0 a) a))
+
+(defun last-cons (l) (if (cdr l) (last-cons (cdr l)) l))
+(defun take (n l)
+  (if (or (<= n 0) (not l)) () (cons (car l) (take (- n 1) (cdr l)))))
+(defun drop (n l)
+  (if (or (<= n 0) (not l)) l (drop (- n 1) (cdr l))))
+(defun remove-item (x l)
+  (filter (lambda (y) (not (eq x y))) l))
+(defun list-index (x l)
+  (let ((i 0) (res ()))
+    (block found
+      (for-each y l
+        (when (eq x y) (setf res i) (return-from found res))
+        (setf i (+ i 1))))
+    res))
+(defun delete-dups (l)
+  (let ((res ()))
+    (for-each x l (unless (member x res) (setf res (cons x res))))
+    (reverse res)))
+(defun joinl (l) (list-to-string l))      ; join list of strings
+(defun nreverse (l) (reverse l))
+
+;;; ------------------------------------------------------------------
+;;; dict based records
+
+(defun dget (d k) (if (dict-has-key d k) (dict-getvalue d k) ()))
+(defun dput (d k v) (dict-set d k v) v)
+(defun dhas (d k) (dict-has-key d k))
+(defun dkeys (d) (map1 car (dict-to-list d)))
+
+;;; ------------------------------------------------------------------
+;;; strings
+
+(setq *re-ext* (dict-getvalue regex-const 'reg_extended))
+(defun re-match (pat s n) (regex-match pat s n *re-ext* 0))
+(defun re-test (pat s) (if (regex-match pat s 1 *re-ext* 0) :t ()))
+
+(defun slen (s) (string-length s))
+(defun sref (s i) (string-nth i s))           ; one byte string
+(defun bref (s i) (ord (string-nth i s)))     ; byte value
+
+(defun substr (s a b)                         ; bytes [a,b)
+  (let ((n (string-length s)))
+    (when (> b n) (setf b n))
+    (when (< a 0) (setf a 0))
+    (cond ((>= a b) "")
+          ((and (= a 0) (= b n)) s)
+          (:else (string-slice s a b)))))
+(defun substr-from (s a) (substr s a (string-length s)))
+
+(defun str-repeat (s n)
+  (if (<= n 0) ""
+      (let ((l ()))
+        (for-each i (mdrange n) (setf l (cons s l)))
+        (list-to-string l))))
+(defun spaces (n) (str-repeat " " n))
+
+(defun str-find-char (s c start)               ; index or nil
+  (let ((n (string-length s)) (i start) (res ()))
+    (while (and (< i n) (not res))
+      (if (eq (string-nth i s) c) (setf res i) (setf i (+ i 1))))
+    res))
+
+(defun str-index (s sub start)                  ; first index of sub in s >= start
+  (let ((n (string-length s)) (m (string-length sub)) (i start) (res ()))
+    (cond ((= m 0) start)
+          (:else
+           (let ((c0 (string-nth 0 sub)))
+             (while (and (not res) (<= (+ i m) n))
+               (let ((j (str-find-char s c0 i)))
+                 (cond ((not j) (setf i (+ n 1)))
+                       ((> (+ j m) n) (setf i (+ n 1)))
+                       ((eq (substr s j (+ j m)) sub) (setf res j))
+                       (:else (setf i (+ j 1)))))))
+           res))))
+
+(defun str-rindex (s sub end)                   ; last index i with i+m <= end
+  (let ((m (string-length sub)) (i (- end (string-length sub))) (res ()))
+    (while (and (not res) (>= i 0))
+      (if (eq (substr s i (+ i m)) sub) (setf res i) (setf i (- i 1))))
+    res))
+
+(defun str-prefix-p (p s)
+  (and (<= (string-length p) (string-length s))
+       (eq (substr s 0 (string-length p)) p)))
+(defun str-suffix-p (p s)
+  (and (<= (string-length p) (string-length s))
+       (eq (substr s (- (string-length s) (string-length p)) (string-length s)) p)))
+(defun str-contains (s sub) (if (str-index s sub 0) :t ()))
+
+(defun split-lines (s)                          ; "a\nb" -> ("a" "b"); "" -> ("")
+  (let ((res ()) (start 0) (i 0) (n (string-length s)))
+    (while (< i n)
+      (when (eq (string-nth i s) "\n")
+        (setf res (cons (substr s start i) res))
+        (setf start (+ i 1)))
+      (setf i (+ i 1)))
+    (setf res (cons (substr s start n) res))
+    (reverse res)))
+
+(defun join-lines (l)
+  (if (not l) ""
+      (let ((res (list (car l))))
+        (for-each x (cdr l) (setf res (cons x (cons "\n" res))))
+        (list-to-string (reverse res)))))
+
+(defun string-join* (sep l)
+  (if (not l) ""
+      (let ((res (list (car l))))
+        (for-each x (cdr l) (setf res (cons x (cons sep res))))
+        (list-to-string (reverse res)))))
+
+(defun split-by (s d)                           ; split on 1-char delimiter
+  (let ((res ()) (start 0) (i 0) (n (string-length s)))
+    (while (< i n)
+      (when (eq (string-nth i s) d)
+        (setf res (cons (substr s start i) res))
+        (setf start (+ i 1)))
+      (setf i (+ i 1)))
+    (reverse (cons (substr s start n) res))))
+
+(defun char-upcase-ascii (c)
+  (let ((b (ord c))) (if (and (>= b 97) (<= b 122)) (chr (- b 32)) c)))
+(defun char-downcase-ascii (c)
+  (let ((b (ord c))) (if (and (>= b 65) (<= b 90)) (chr (+ b 32)) c)))
+(defun map-chars (f s)
+  (let ((l ()) (n (string-length s)))
+    (for-each i (mdrange n) (setf l (cons (f (string-nth i s)) l)))
+    (list-to-string (reverse l))))
+(defun str-upcase (s) (map-chars char-upcase-ascii s))
+(defun str-downcase (s) (map-chars char-downcase-ascii s))
+(defun str-capitalize (s)
+  (if (= (string-length s) 0) s
+      (string-concat (str-upcase (substr s 0 1)) (str-downcase (substr s 1 (string-length s))))))
+
+(defun num->str (n) (reprn n))
+(defun str->num (s)                              ; non-negative integer or nil
+  (if (re-test "^[0-9]+$" s) (eval (read-string s)) ()))
+
+;; trimming
+(defun ws-char-p (c) (or (eq c " ") (eq c "\t")))
+(defun leading-ws-len (s)
+  (let ((i 0) (n (string-length s)))
+    (while (and (< i n) (ws-char-p (string-nth i s))) (setf i (+ i 1)))
+    i))
+(defun trailing-ws-start (s)                     ; index where trailing ws begins
+  (let ((i (string-length s)))
+    (while (and (> i 0) (ws-char-p (string-nth (- i 1) s))) (setf i (- i 1)))
+    i))
+(defun str-trim (s)
+  (let ((a (leading-ws-len s)) (b (trailing-ws-start s)))
+    (if (>= a b) "" (substr s a b))))
+(defun str-trim-right (s) (substr s 0 (trailing-ws-start s)))
+(defun blank-p (s) (= (leading-ws-len s) (string-length s)))
+
+;;; ------------------------------------------------------------------
+;;; UTF-8.  Strings are bytes; "character" boundaries are found by skipping
+;;; continuation bytes (10xxxxxx).
+
+(defun u8-cont-p (s i)
+  (let ((b (ord (string-nth i s)))) (and (>= b 128) (< b 192))))
+(defun u8-next (s i)                             ; start of next char after i
+  (let ((n (string-length s)) (j (+ i 1)))
+    (while (and (< j n) (u8-cont-p s j)) (setf j (+ j 1)))
+    (imin j n)))
+(defun u8-prev (s i)                             ; start of the char before i
+  (let ((j (- i 1)))
+    (while (and (> j 0) (u8-cont-p s j)) (setf j (- j 1)))
+    (imax j 0)))
+(defun u8-char-at (s i) (substr s i (u8-next s i)))
+(defun u8-count (s a b)                          ; chars in bytes [a,b)
+  (let ((c 0) (i a))
+    (while (< i b)
+      (unless (u8-cont-p s i) (setf c (+ c 1)))
+      (setf i (+ i 1)))
+    c))
+(defun u8-length (s) (u8-count s 0 (string-length s)))
+(defun u8-seq-len (b)                            ; length from lead byte
+  (cond ((< b 128) 1) ((< b 192) 1) ((< b 224) 2) ((< b 240) 3) (:else 4)))
+(defun u8-encode (cp)                            ; code point -> string
+  (cond ((< cp 128) (chr cp))
+        ((< cp 2048) (string-concat (chr (+ 192 (idiv cp 64))) (chr (+ 128 (mod cp 64)))))
+        ((< cp 65536) (list-to-string (list (chr (+ 224 (idiv cp 4096)))
+                                           (chr (+ 128 (mod (idiv cp 64) 64)))
+                                           (chr (+ 128 (mod cp 64))))))
+        (:else (list-to-string (list (chr (+ 240 (idiv cp 262144)))
+                                    (chr (+ 128 (mod (idiv cp 4096) 64)))
+                                    (chr (+ 128 (mod (idiv cp 64) 64)))
+                                    (chr (+ 128 (mod cp 64))))))))
+
+;; display columns of a line: tab -> next tab stop, control chars -> ^X
+(defun char-display-width (s i col tabw)
+  (let ((b (ord (string-nth i s))))
+    (cond ((= b 9) (- tabw (mod col tabw)))
+          ((or (< b 32) (= b 127)) 2)
+          (:else 1))))
+(defun display-col (s byte tabw)                  ; display column of byte offset
+  (let ((col 0) (i 0) (n (imin byte (string-length s))))
+    (while (< i n)
+      (setf col (+ col (char-display-width s i col tabw)))
+      (setf i (u8-next s i)))
+    col))
+(defun byte-at-col (s col tabw)                   ; byte offset whose column <= col (nearest)
+  (let ((c 0) (i 0) (n (string-length s)) (done ()))
+    (while (and (< i n) (not done))
+      (let ((w (char-display-width s i c tabw)))
+        (if (> (+ c w) col)
+            (setf done :t)
+            (progn (setf c (+ c w)) (setf i (u8-next s i))))))
+    i))
+
+;;; word characters (non-ASCII bytes count as word constituents)
+(setq *word-extra* "")
+(defun word-char-p (c)
+  (let ((b (ord c)))
+    (or (and (>= b 48) (<= b 57)) (and (>= b 65) (<= b 90))
+        (and (>= b 97) (<= b 122)) (>= b 128)
+        (str-contains *word-extra* c))))
+(defun digit-char-p (c) (let ((b (ord c))) (and (>= b 48) (<= b 57))))
+(defun alpha-char-p (c) (let ((b (ord c))) (or (and (>= b 65) (<= b 90)) (and (>= b 97) (<= b 122)))))
+(defun ident-start-p (c) (or (alpha-char-p c) (eq c "_")))
+(defun ident-char-p (c) (or (alpha-char-p c) (digit-char-p c) (eq c "_")))
+
+;;; positions are (line . col) conses
+(defun pos (l c) (cons l c))
+(defun pos-line (p) (car p))
+(defun pos-col (p) (cdr p))
+(defun pos< (a b) (or (< (car a) (car b)) (and (= (car a) (car b)) (< (cdr a) (cdr b)))))
+(defun pos= (a b) (and (= (car a) (car b)) (= (cdr a) (cdr b))))
+(defun pos<= (a b) (not (pos< b a)))
+(defun pos-min (a b) (if (pos< a b) a b))
+(defun pos-max (a b) (if (pos< a b) b a))
+
+;; hash set helpers
+(defun set-of (l) (let ((d (make-dict))) (for-each x l (dict-set d x :t)) d))
+(defun set-has (d x) (dict-has-key d x))
+
+;; a tiny logger for debugging
+(defun dbg (x) (let ((f (file-open "/tmp/limacs-debug.log" "a"))) (file-write f (string-concat (repr x) "\n")) (file-close f)))
+
+(defun cadddr (l) (car (cdr (cdr (cdr l)))))

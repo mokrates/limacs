@@ -1,0 +1,7 @@
+(setq *limacs-dir* "/home/claude/limacs/")
+(load "/home/claude/limacs/limacs.limo")
+(setf *term-kind* 'test)
+(limacs-init-buffers ())
+(redraw)
+(dump-frame)
+(exit)

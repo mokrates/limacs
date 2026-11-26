@@ -1,0 +1,289 @@
+;; -*- limo -*-
+;; limacs/lib/commands.limo --- motion and editing commands.
+
+(setq *last-event* "")
+(setq *pushback* ())
+(setq *this-command* ())
+(setq *last-command* ())
+(setq *kill-ring* ())
+(setq *running* :t)
+(setq *vertical-commands* '(next-line previous-line scroll-up-command scroll-down-command))
+
+(defun unread-event (e) (setf *pushback* (cons e *pushback*)))
+(defun read-event ()
+  (cond (*pushback* (let ((k (car *pushback*))) (setf *pushback* (cdr *pushback*)) k))
+        ((or *kmacro-queue* *kmacro-repeat* *kmacro-strict* *kmacro-executing*)
+         (let ((e (kmacro-next-event)))                       ; a running keyboard macro "types" for us
+           (if e e (read-event))))                            ; (note: `or` would evaluate its first argument twice)
+        (:else
+         (unless (term-key-pending-p) (when (eq *term-kind* 'tty) (redraw)))
+         (if *pushback*
+             (let ((k (car *pushback*))) (setf *pushback* (cdr *pushback*)) k)
+             (term-read-key)))))
+
+(defun user-error (fmt . args)
+  (throw (list 'user-error (apply format (cons fmt args)))))
+
+;;; ------------------------------------------------------------------
+;;; position arithmetic
+
+(defun char-at (p)                       ; char string at P, "\n" at end of line, nil at eob
+  (let ((l (car p)) (c (cdr p)))
+    (cond ((< c (buf-line-length l)) (u8-char-at (buf-line l) c))
+          ((< l (- (buf-nlines) 1)) "\n")
+          (:else ()))))
+(defun char-before-pos (p)
+  (let ((l (car p)) (c (cdr p)))
+    (cond ((> c 0) (u8-char-at (buf-line l) (u8-prev (buf-line l) c)))
+          ((> l 0) "\n")
+          (:else ()))))
+(defun next-pos (p)
+  (let ((l (car p)) (c (cdr p)))
+    (cond ((< c (buf-line-length l)) (cons l (u8-next (buf-line l) c)))
+          ((< l (- (buf-nlines) 1)) (cons (+ l 1) 0))
+          (:else p))))
+(defun prev-pos (p)
+  (let ((l (car p)) (c (cdr p)))
+    (cond ((> c 0) (cons l (u8-prev (buf-line l) c)))
+          ((> l 0) (cons (- l 1) (buf-line-length (- l 1))))
+          (:else p))))
+(defun pos-fwd (p n)
+  (let ((q p))
+    (while (> n 0) (setf q (next-pos q)) (setf n (- n 1)))
+    (while (< n 0) (setf q (prev-pos q)) (setf n (+ n 1)))
+    q))
+(defun pos-forward-word (p)
+  (let ((q p) (c (char-at p)))
+    (while (and c (not (and (not (eq c "\n")) (word-char-p c)))) (setf q (next-pos q)) (setf c (char-at q)))
+    (while (and c (not (eq c "\n")) (word-char-p c)) (setf q (next-pos q)) (setf c (char-at q)))
+    q))
+(defun pos-backward-word (p)
+  (let ((q p) (c (char-before-pos p)))
+    (while (and c (not (and (not (eq c "\n")) (word-char-p c)))) (setf q (prev-pos q)) (setf c (char-before-pos q)))
+    (while (and c (not (eq c "\n")) (word-char-p c)) (setf q (prev-pos q)) (setf c (char-before-pos q)))
+    q))
+(defun line-end-pos (l) (cons l (buf-line-length l)))
+
+;;; ------------------------------------------------------------------
+;;; kill ring
+
+(defun kill-new (text . append-mode)           ; append-mode: nil | 'after | 'before
+  (let ((mode (if append-mode (car append-mode) ())))
+    (cond ((and mode *kill-ring*)
+           (setf *kill-ring* (cons (if (eq mode 'before) (string-concat text (car *kill-ring*)) (string-concat (car *kill-ring*) text)) (cdr *kill-ring*))))
+          (:else (setf *kill-ring* (cons text *kill-ring*))
+                 (when (> (list-length *kill-ring*) 60) (setf *kill-ring* (take 60 *kill-ring*)))))))
+(defun killing-p () (member *last-command* '(kill-line kill-word backward-kill-word kill-region kill-whole-line)))
+(defun kill-region-text (a b dir)               ; kill text between positions, honouring append
+  (let ((text (buffer-substring a b)))
+    (delete-between a b)
+    (kill-new text (if (killing-p) (if (eq dir 'back) 'before 'after) ()))
+    text))
+
+;;; ------------------------------------------------------------------
+;;; motion commands
+
+(defcommand forward-char () "Move point forward N characters."
+  (let ((n (prefix-n))) (set-point (pos-fwd (point) n))))
+(defcommand backward-char () "Move point backward N characters."
+  (let ((n (prefix-n))) (set-point (pos-fwd (point) (- 0 n)))))
+(defun move-vertically (n)
+  (let* ((l (point-line)) (tw (var 'tab-width))
+         (goal (or (bf goal) (display-col (buf-line l) (point-col) tw)))
+         (nl (+ l n)))
+    (bf! goal goal)
+    (cond ((< nl 0) (set-point (cons 0 0)) (user-error "Beginning of buffer"))
+          ((>= nl (buf-nlines)) (set-point (buffer-end)) (user-error "End of buffer"))
+          (:else (set-point (cons nl (byte-at-col (buf-line nl) goal tw)))))))
+(defcommand next-line () "Move to the next line." (move-vertically (prefix-n)))
+(defcommand previous-line () "Move to the previous line." (move-vertically (- 0 (prefix-n))))
+(defcommand beginning-of-line () "Move to the beginning of the line." (set-point (cons (point-line) 0)))
+(defcommand end-of-line () "Move to the end of the line." (set-point (line-end-pos (point-line))))
+(defcommand back-to-indentation () "Move to the first non-blank character of the line."
+  (set-point (cons (point-line) (leading-ws-len (current-line-text)))))
+(defcommand forward-word () "Move forward over a word."
+  (let ((n (prefix-n))) (while (> n 0) (set-point (pos-forward-word (point))) (setf n (- n 1)))
+    (while (< n 0) (set-point (pos-backward-word (point))) (setf n (+ n 1)))))
+(defcommand backward-word () "Move backward over a word."
+  (let ((n (prefix-n))) (while (> n 0) (set-point (pos-backward-word (point))) (setf n (- n 1)))))
+(defcommand beginning-of-buffer () "Go to the start of the buffer."
+  (set-mark-quiet) (set-point (buffer-start)))
+(defcommand end-of-buffer () "Go to the end of the buffer."
+  (set-mark-quiet) (set-point (buffer-end)))
+(defun set-mark-quiet () (bf! mark (point)) (bf! mark-active ()))
+(defcommand scroll-up-command () "Scroll forward one screen."
+  (let ((h (imax 1 (- (text-height) 2))))
+    (bf! top (imin (- (buf-nlines) 1) (+ (bf top) h)))
+    (move-vertically h)))
+(defcommand scroll-down-command () "Scroll backward one screen."
+  (let ((h (imax 1 (- (text-height) 2))))
+    (bf! top (imax 0 (- (bf top) h)))
+    (move-vertically (- 0 h))))
+(defcommand recenter-top-bottom () "Recenter the window on point."
+  (bf! recenter :t))
+(defcommand goto-line () "Go to a line number."
+  (let ((n (str->num (read-minibuffer "Goto line: " "" ()))))
+    (when n (set-mark-quiet) (set-point (cons (imax 0 (- n 1)) 0)))))
+(defcommand forward-paragraph () "Move to the end of the paragraph."
+  (let ((l (point-line)) (last (- (buf-nlines) 1)))
+    (while (and (< l last) (blank-p (buf-line l))) (setf l (+ l 1)))
+    (while (and (< l last) (not (blank-p (buf-line l)))) (setf l (+ l 1)))
+    (set-point (cons l 0))))
+(defcommand backward-paragraph () "Move to the start of the paragraph."
+  (let ((l (point-line)))
+    (while (and (> l 0) (blank-p (buf-line l))) (setf l (- l 1)))
+    (while (and (> l 0) (not (blank-p (buf-line l)))) (setf l (- l 1)))
+    (set-point (cons l 0))))
+
+;;; ------------------------------------------------------------------
+;;; mark & region
+
+(defcommand set-mark-command () "Set the mark where point is."
+  (cond ((and *prefix-arg* (bf mark)) (let ((m (bf mark))) (bf! mark (point)) (set-point m)))
+        (:else (set-mark (point)) (message "Mark set"))))
+(defcommand exchange-point-and-mark () "Swap point and mark."
+  (let ((m (bf mark))) (when m (bf! mark (point)) (set-point m) (bf! mark-active :t))))
+(defcommand mark-whole-buffer () "Select the whole buffer."
+  (set-mark (buffer-end)) (set-point (buffer-start)))
+(defcommand keyboard-quit () "Cancel the current operation." (deactivate-mark) (throw 'quit))
+(defun require-region ()
+  (unless (bf mark) (user-error "The mark is not set now")))
+
+;;; ------------------------------------------------------------------
+;;; deleting & killing
+
+(defcommand delete-char () "Delete the character after point."
+  (let ((n (prefix-n)))
+    (if (region-active-p) (let ((rb (region-bounds))) (delete-between (car rb) (cdr rb)) (deactivate-mark))
+        (let ((q (pos-fwd (point) n)))
+          (when (pos= q (point)) (user-error "End of buffer"))
+          (delete-between (point) q)))))
+(defcommand delete-backward-char () "Delete the character before point."
+  (let ((n (prefix-n)))
+    (cond ((and (bf im-state) (dget (bf im-state) 'keys) (im-backspace)) ())
+          ((region-active-p) (let ((rb (region-bounds))) (delete-between (car rb) (cdr rb)) (deactivate-mark)))
+          (:else
+           (let ((q (pos-fwd (point) (- 0 n))))
+             (when (pos= q (point)) (user-error "Beginning of buffer"))
+             ;; delete both halves of an empty electric pair
+             (if (and (= n 1) (pair-between-p (point)))
+                 (delete-between q (next-pos (point)))
+                 (delete-between q (point))))))))
+(defcommand kill-line () "Kill to the end of the line (or the newline at the end)."
+  (let* ((p (point)) (l (car p)) (len (buf-line-length l)) (n *prefix-arg*))
+    (cond ((and n (not (eq n '-)))
+           (kill-region-text p (cons (imin (- (buf-nlines) 1) (+ l (prefix-n))) 0) 'fwd))
+          ((and (= (cdr p) len) (< l (- (buf-nlines) 1))) (kill-region-text p (cons (+ l 1) 0) 'fwd))
+          ((= (cdr p) len) (user-error "End of buffer"))
+          (:else (kill-region-text p (cons l len) 'fwd)))))
+(defcommand kill-whole-line () "Kill the whole current line."
+  (let ((l (point-line)))
+    (if (< l (- (buf-nlines) 1))
+        (kill-region-text (cons l 0) (cons (+ l 1) 0) 'fwd)
+        (kill-region-text (if (> l 0) (line-end-pos (- l 1)) (cons l 0)) (line-end-pos l) 'fwd))))
+(defcommand kill-word () "Kill characters forward until the end of a word."
+  (let ((q (point))) (for-each i (mdrange (prefix-n)) (setf q (pos-forward-word q)))
+    (kill-region-text (point) q 'fwd)))
+(defcommand backward-kill-word () "Kill characters backward until the start of a word."
+  (let ((q (point))) (for-each i (mdrange (prefix-n)) (setf q (pos-backward-word q)))
+    (kill-region-text q (point) 'back)))
+(defcommand kill-region () "Kill the region."
+  (require-region)
+  (let ((rb (region-bounds))) (kill-region-text (car rb) (cdr rb) 'fwd) (deactivate-mark)))
+(defcommand copy-region-as-kill () "Save the region as if killed, but don't kill it."
+  (require-region)
+  (let ((rb (region-bounds))) (kill-new (buffer-substring (car rb) (cdr rb))) (deactivate-mark) (message "Copied")))
+(defcommand yank () "Reinsert the last stretch of killed text."
+  (unless *kill-ring* (user-error "Kill ring is empty"))
+  (let ((start (point)))
+    (insert (car *kill-ring*))
+    (bf! mark start) (bf! mark-active ())
+    (bf! yank-start start) (bf! yank-index 0)))
+(defcommand yank-pop () "Replace the just-yanked text with an earlier kill."
+  (unless (eq *last-command* 'yank) (user-error "Previous command was not a yank"))
+  (let* ((idx (mod (+ 1 (bf yank-index)) (list-length *kill-ring*))))
+    (delete-between (bf yank-start) (point))
+    (insert (nth idx *kill-ring*))
+    (bf! yank-index idx)
+    (setf *this-command* 'yank)))
+(defcommand delete-horizontal-space () "Delete spaces and tabs around point."
+  (let* ((l (point-line)) (s (buf-line l)) (c (point-col)) (a c) (b c))
+    (while (and (> a 0) (ws-char-p (sref s (- a 1)))) (setf a (- a 1)))
+    (while (and (< b (slen s)) (ws-char-p (sref s b))) (setf b (+ b 1)))
+    (delete-between (cons l a) (cons l b))))
+(defcommand just-one-space () "Replace whitespace around point with a single space."
+  (delete-horizontal-space) (insert " "))
+(defcommand delete-indentation () "Join this line to the previous one."
+  (let ((l (point-line)))
+    (when (> l 0)
+      (let* ((prev (buf-line (- l 1))) (cur (buf-line l)) (ws (leading-ws-len cur))
+             (pe (trailing-ws-start prev)))
+        (delete-between (cons (- l 1) pe) (cons l ws))
+        (set-point (cons (- l 1) pe))
+        (unless (or (= pe 0) (>= ws (slen cur)) (eq (sref cur ws) ")")) (insert " "))))))
+(defcommand delete-blank-lines () "Delete blank lines around point."
+  (let ((a (point-line)) (b (point-line)) (last (- (buf-nlines) 1)))
+    (while (and (> a 0) (blank-p (buf-line (- a 1)))) (setf a (- a 1)))
+    (while (and (< b last) (blank-p (buf-line (+ b 1)))) (setf b (+ b 1)))
+    (cond ((and (blank-p (current-line-text)) (> b a))
+           (delete-between (cons a 0) (cons b 0)) (set-point (cons a 0)))
+          ((blank-p (current-line-text))
+           (delete-between (cons a 0) (cons (imin last (+ b 1)) 0)))
+          (:else (when (< b last) (when (> b (point-line)) (delete-between (cons (+ (point-line) 1) 0) (cons (+ b 1) 0))))))))
+(defcommand open-line () "Insert a newline and leave point before it."
+  (let ((p (point))) (insert "\n") (set-point p)))
+(defcommand transpose-chars () "Interchange characters around point."
+  (let* ((p (point)) (l (car p)) (s (buf-line l)) (c (cdr p)))
+    (when (= c (slen s)) (setf c (u8-prev s c)))
+    (when (> c 0)
+      (let* ((b (u8-prev s c)) (a1 (substr s b c)) (a2 (u8-char-at s c)) (e (+ c (slen a2))))
+        (delete-between (cons l b) (cons l e))
+        (insert-at (cons l b) (string-concat a2 a1))
+        (set-point (cons l e))))))
+(defun apply-to-word (f)
+  (let* ((a (point)) (b (pos-forward-word a)) (text (buffer-substring a b)))
+    (delete-between a b) (insert (f text))))
+(defcommand upcase-word () "Convert following word to upper case." (apply-to-word str-upcase))
+(defcommand downcase-word () "Convert following word to lower case." (apply-to-word str-downcase))
+(defcommand capitalize-word () "Capitalize the following word." (apply-to-word str-capitalize))
+(defcommand transpose-words () "Interchange words around point."
+  (let* ((e2 (pos-forward-word (point))) (s2 (pos-backward-word e2)) (s1 (pos-backward-word s2)) (e1 (pos-forward-word s1)))
+    (when (and (pos< e1 s2) (= (car s1) (car e2)))
+      (let ((w1 (buffer-substring s1 e1)) (mid (buffer-substring e1 s2)) (w2 (buffer-substring s2 e2)))
+        (delete-between s1 e2)
+        (insert-at s1 (string-concat w2 mid w1))
+        (set-point (end-pos-after s1 (string-concat w2 mid w1)))))))
+
+;;; ------------------------------------------------------------------
+;;; undo
+
+(defcommand undo () "Undo some previous changes."
+  (undo-boundary)
+  (if (buffer-undo) (message "Undo") (user-error "No further undo information")))
+(defcommand redo () "Redo the last undone change."
+  (undo-boundary)
+  (if (buffer-redo) (message "Redo") (user-error "No further redo information")))
+
+;;; ------------------------------------------------------------------
+;;; prefix arguments
+
+(setq *pending-prefix* ())
+(defcommand universal-argument () "Begin a numeric argument for the following command."
+  (let ((n 4) (digits ()) (done ()) (neg ()))
+    (message "C-u")
+    (while (not done)
+      (let ((e (read-event)))
+        (cond ((eq e "C-u") (if digits (setf done :t) (setf n (* n 4))) (when done (unread-event e)))
+              ((re-test "^[0-9]$" e) (setf digits (+ (* 10 (or digits 0)) (str->num e))))
+              ((and (eq e "-") (not digits)) (setf neg :t))
+              (:else (unread-event e) (setf done :t)))))
+    (setf *pending-prefix* (cond (digits (if neg (- 0 digits) digits)) (neg '-) (:else n)))))
+(defcommand digit-argument () "Part of a numeric argument."
+  (let ((e *last-event*) (digits ()) (done ()))
+    (setf digits (str->num e))
+    (while (not done)
+      (let ((k (read-event)))
+        (cond ((re-test "^[0-9]$" k) (setf digits (+ (* 10 digits) (str->num k))))
+              (:else (unread-event k) (setf done :t)))))
+    (setf *pending-prefix* digits)))
+(defcommand negative-argument () "Begin a negative numeric argument." (setf *pending-prefix* '-))

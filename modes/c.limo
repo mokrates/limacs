@@ -1,0 +1,228 @@
+;; -*- limo -*-
+;; limacs/modes/c.limo --- major mode for C.
+;;
+;; Scanner state: (SMODE . STACK)
+;;   SMODE  nil | (comment line col)     inside a /* ... */ comment
+;;   STACK  open brackets, innermost first, each (line col char)
+
+(setq *c-offset* 4)
+(setq *c-keywords*
+  (set-of '("auto" "break" "case" "const" "continue" "default" "do" "else" "enum" "extern" "for" "goto" "if" "inline"
+            "register" "restrict" "return" "sizeof" "static" "struct" "switch" "typedef" "union" "volatile" "while"
+            "_Alignas" "_Alignof" "_Atomic" "_Generic" "_Noreturn" "_Static_assert" "_Thread_local"
+            "class" "namespace" "template" "public" "private" "protected" "new" "delete" "this" "try" "catch" "throw" "using" "virtual" "operator")))
+(setq *c-types*
+  (set-of '("int" "char" "short" "long" "float" "double" "void" "signed" "unsigned" "bool" "_Bool" "size_t" "ssize_t"
+            "ptrdiff_t" "FILE" "wchar_t" "va_list" "off_t" "time_t" "DIR" "uint8_t" "uint16_t" "uint32_t" "uint64_t"
+            "int8_t" "int16_t" "int32_t" "int64_t" "intptr_t" "uintptr_t")))
+(setq *c-constants* (set-of '("NULL" "true" "false" "EOF" "stdin" "stdout" "stderr" "nullptr" "EXIT_SUCCESS" "EXIT_FAILURE")))
+(setq *c-control* (set-of '("if" "for" "while" "switch")))
+
+(defun c-skip-string (line j quote)                 ; J just after the opening quote -> index after closing one
+  (let ((n (slen line)) (closed ()))
+    (while (and (< j n) (not closed))
+      (cond ((eq (sref line j) "\\") (setf j (+ j 2)))
+            ((eq (sref line j) quote) (setf closed :t) (setf j (+ j 1)))
+            (:else (setf j (+ j 1)))))
+    (imin j n)))
+
+(defun c-scan-line (line state)
+  (let* ((smode (car state)) (stack (cdr state)) (n (slen line)) (i 0) (acc ()) (lineno *scan-line-no*)
+         (prev-word ()) (preproc ()))
+    (when (and (not smode) (str-prefix-p "#" (substr-from line (leading-ws-len line))))
+      (setf preproc :t))
+    (while (< i n)
+      (cond
+       (smode
+        (let ((e (str-index line "*/" i)))
+          (cond (e (setf acc (span-list-add acc i (+ e 2) 'comment)) (setf smode ()) (setf i (+ e 2)))
+                (:else (setf acc (span-list-add acc i n 'comment)) (setf i n)))))
+       (:else
+        (let ((c (sref line i)) (c2 (if (< (+ i 1) n) (sref line (+ i 1)) "")))
+          (cond
+           ((and (eq c "/") (eq c2 "/")) (setf acc (span-list-add acc i n 'comment)) (setf i n))
+           ((and (eq c "/") (eq c2 "*"))
+            (setf smode (list 'comment lineno i))
+            (let ((e (str-index line "*/" (+ i 2))))
+              (cond (e (setf acc (span-list-add acc i (+ e 2) 'comment)) (setf smode ()) (setf i (+ e 2)))
+                    (:else (setf acc (span-list-add acc i n 'comment)) (setf i n)))))
+           ((eq c "\"") (let ((e (c-skip-string line (+ i 1) "\""))) (setf acc (span-list-add acc i e 'string)) (setf i e)))
+           ((eq c "'") (let ((e (c-skip-string line (+ i 1) "'"))) (setf acc (span-list-add acc i e 'string)) (setf i e)))
+           ((and preproc (eq c "#") (= i (leading-ws-len line)))
+            (let ((j (+ i 1)))
+              (while (and (< j n) (ws-char-p (sref line j))) (setf j (+ j 1)))
+              (while (and (< j n) (ident-char-p (sref line j))) (setf j (+ j 1)))
+              (setf acc (span-list-add acc i j 'preproc))
+              (let ((dir (str-trim (substr line (+ i 1) j))))
+                (setf prev-word dir)
+                (when (and (eq dir "include") (< j n))
+                  (let ((k (+ j (leading-ws-len (substr-from line j)))))
+                    (when (and (< k n) (member (sref line k) '("<" "\"")))
+                      (let ((e (str-find-char line (if (eq (sref line k) "<") ">" "\"") (+ k 1))))
+                        (setf acc (span-list-add acc k (if e (+ e 1) n) 'string))
+                        (setf j (if e (+ e 1) n)))))))
+              (setf i j)))
+           ((or (eq c "(") (eq c "[") (eq c "{")) (setf stack (cons (list lineno i c) stack)) (setf i (+ i 1)))
+           ((or (eq c ")") (eq c "]") (eq c "}")) (when stack (setf stack (cdr stack))) (setf i (+ i 1)))
+           ((or (digit-char-p c) (and (eq c ".") (< (+ i 1) n) (digit-char-p c2)))
+            (let ((j i))
+              (if (and (eq c "0") (or (eq c2 "x") (eq c2 "X")))
+                  (progn (setf j (+ i 2)) (while (and (< j n) (or (digit-char-p (sref line j)) (re-test "^[a-fA-F]$" (sref line j)))) (setf j (+ j 1))))
+                  (while (and (< j n) (or (digit-char-p (sref line j)) (eq (sref line j) ".")
+                                          (and (member (sref line j) '("e" "E")) (< (+ j 1) n) (or (digit-char-p (sref line (+ j 1))) (member (sref line (+ j 1)) '("+" "-"))) (setf j (+ j 1)))))
+                    (setf j (+ j 1))))
+              (while (and (< j n) (member (sref line j) '("u" "U" "l" "L" "f" "F"))) (setf j (+ j 1)))
+              (setf acc (span-list-add acc i j 'number)) (setf i j)))
+           ((ident-start-p c)
+            (let ((j i))
+              (while (and (< j n) (ident-char-p (sref line j))) (setf j (+ j 1)))
+              (let* ((tok (substr line i j)) (face ())
+                     (after (let ((k j)) (while (and (< k n) (ws-char-p (sref line k))) (setf k (+ k 1))) (if (< k n) (sref line k) ""))))
+                (cond ((dhas *c-keywords* tok) (setf face 'keyword))
+                      ((dhas *c-types* tok) (setf face 'type))
+                      ((dhas *c-constants* tok) (setf face 'constant))
+                      ((member prev-word '("struct" "union" "enum")) (setf face 'type))
+                      ((str-suffix-p "_t" tok) (setf face 'type))
+                      ((and (eq after "(") (not stack) (not preproc)) (setf face 'function))
+                      ((and preproc (eq prev-word "define") (not (eq after "")) ()) ())
+                      ((and preproc (eq prev-word "define")) (setf face 'function))
+                      (:else ()))
+                (when face (setf acc (span-list-add acc i j face)))
+                (setf prev-word tok)
+                (setf i j))))
+           (:else (setf i (+ i 1))))))))
+    (cons (reverse acc) (cons smode stack))))
+
+(defun c-skip-regex (state)
+  (if (car state) "\\*/" "[][(){}\"'/]"))
+
+;;; ------------------------------------------------------------------
+;;; indentation
+
+(defun c-line-state (k) (line-state k))
+(defun c-last-code-char (k)                           ; last non-blank, non-comment char of line K
+  (let* ((s (buf-line k)) (i (- (slen s) 1)) (res ()))
+    (line-spans k)                                    ; make sure face info is cached
+    (while (and (>= i 0) (not res))
+      (let ((ch (sref s i)))
+        (if (or (ws-char-p ch) (eq (face-at k i) 'comment)) (setf i (- i 1)) (setf res ch))))
+    res))
+(defun c-first-word (s)
+  (let* ((t1 (str-trim s)) (j 0) (n (slen t1)))
+    (while (and (< j n) (ident-char-p (sref t1 j))) (setf j (+ j 1)))
+    (substr t1 0 j)))
+(defun c-code-line-p (k)
+  (let ((st (c-line-state k)) (t1 (str-trim (buf-line k))))
+    (and (not (car st)) (> (slen t1) 0)
+         (not (str-prefix-p "#" t1)) (not (str-prefix-p "//" t1)) (not (str-prefix-p "/*" t1)))))
+(defun c-label-p (s) (let ((w (c-first-word s))) (or (eq w "case") (eq w "default"))))
+(defun c-header-p (k)                                  ; control header without braces: if (..)  else  do
+  (let* ((s (buf-line k)) (w (c-first-word s)) (lc (c-last-code-char k)))
+    (or (and (dhas *c-control* w) (eq lc ")"))
+        (and (eq w "else") (not (member lc '("{" ";" "}"))))
+        (and (eq w "else") (eq (str-trim s) "else"))
+        (and (eq (str-trim s) "do")))))
+(defun c-complete-p (k) (member (c-last-code-char k) '(";" "{" "}" ":" ",")))
+
+(defun c-prev-block-line (l stack stop)                ; previous code line at the same bracket depth
+  (let ((k (- l 1)) (res ()))
+    (while (and (> k stop) (not res))
+      (when (and (c-code-line-p k) (deepeq (cdr (c-line-state k)) stack)) (setf res k))
+      (setf k (- k 1)))
+    res))
+
+(defun c-calc-indent (l)
+  (let* ((st (c-line-state l)) (smode (car st)) (stack (cdr st)) (s (buf-line l))
+         (t1 (str-trim s)) (first (if (> (slen t1) 0) (sref t1 0) "")) (tw (var 'tab-width)) (off *c-offset*))
+    (cond
+     (smode
+      (if (str-prefix-p "*" t1) (+ 1 (display-col (buf-line (cadr smode)) (caddr smode) tw)) ()))
+     ((str-prefix-p "#" t1) 0)
+     ((not stack) 0)
+     (:else
+      (let* ((top (car stack)) (ol (car top)) (oc (cadr top)) (och (caddr top)) (os (buf-line ol)))
+        (cond
+         ((closer-p first) (line-indentation ol))
+         ((or (eq och "(") (eq och "["))
+          (let ((rest (substr-from os (+ oc 1))))
+            (if (or (blank-p rest) (str-prefix-p "//" (str-trim rest)) (str-prefix-p "/*" (str-trim rest)))
+                (+ (line-indentation ol) (* 2 off))
+                (+ 1 (display-col os oc tw)))))
+         (:else
+          (let* ((base (+ (line-indentation ol) off)) (p (c-prev-block-line l stack ol)))
+            (cond
+             ((not p) (if (c-label-p s) base base))
+             ((c-label-p s)
+              (let ((k (- l 1)) (found ()))
+                (while (and (> k ol) (not found))
+                  (when (and (c-code-line-p k) (deepeq (cdr (c-line-state k)) stack) (c-label-p (buf-line k))) (setf found k))
+                  (setf k (- k 1)))
+                (if found (line-indentation found) base)))
+             (:else
+              (let ((ind (line-indentation p)) (lc (c-last-code-char p)))
+                (cond
+                 ((and (c-label-p (buf-line p)) (eq lc ":")) (+ ind off))
+                 ((c-header-p p) (if (eq first "{") ind (+ ind off)))
+                 ((c-complete-p p)
+                  ;; unwind finished braceless bodies:  if (x)\n  y;   -> back to the `if' column
+                  (let ((q (c-prev-block-line p stack ol)) (cur p))
+                    (while (and q (c-header-p q) (not (member (c-last-code-char cur) '("{"))))
+                      (setf cur q) (setf q (c-prev-block-line cur stack ol)))
+                    (line-indentation cur)))
+                 (:else                                  ; P is an unfinished statement: continuation
+                  (let ((q (c-prev-block-line p stack ol)))
+                    (if (and q (not (c-complete-p q)) (not (c-header-p q))) ind (+ ind off))))))))))))))))
+
+(defun c-indent-line ()
+  (let* ((l (point-line)) (ind (c-calc-indent l)))
+    (when ind (set-line-indentation l ind))))
+
+(defun c-in-comment-or-string-p ()
+  (in-face-p (point-line) (point-col) '(comment)))
+
+;;; ------------------------------------------------------------------
+;;; formatting: spacing fixes in code (never inside strings/comments), then reindent
+
+(defun c-format-line (k)
+  (let* ((s (buf-line k)) (spans (line-spans k)) (n (slen s)) (out ()) (i 0) (changed ()))
+    (defun code-at (j) (not (member (face-at k j) '(comment string))))
+    (while (< i n)
+      (let ((ch (sref s i)))
+        (cond ((and (eq ch ",") (< (+ i 1) n) (not (ws-char-p (sref s (+ i 1)))) (code-at i))
+               (setf out (cons ", " out)) (setf changed :t) (setf i (+ i 1)))
+              ((and (ident-start-p ch) (or (= i 0) (not (ident-char-p (sref s (- i 1))))))
+               (let ((j i))
+                 (while (and (< j n) (ident-char-p (sref s j))) (setf j (+ j 1)))
+                 (let ((tok (substr s i j)))
+                   (cond ((and (dhas *c-control* tok) (< j n) (eq (sref s j) "(") (code-at i))
+                          (setf out (cons " " (cons tok out))) (setf changed :t))
+                         (:else (setf out (cons tok out)))))
+                 (setf i j)))
+              (:else (setf out (cons ch out)) (setf i (+ i 1))))))
+    (when changed (replace-line k (list-to-string (reverse out))))))
+
+(defun c-format-buffer ()
+  (let ((k 0))
+    (while (< k (buf-nlines)) (c-format-line k) (setf k (+ k 1))))
+  ;; collapse runs of blank lines
+  (let ((k 1))
+    (while (< k (buf-nlines))
+      (if (and (blank-p (buf-line k)) (blank-p (buf-line (- k 1))))
+          (delete-between (cons (- k 1) 0) (cons k 0))
+          (setf k (+ k 1)))))
+  (default-format-buffer))
+
+(define-major-mode c-mode prog-mode "C"
+  :scan-line c-scan-line
+  :skip-regex c-skip-regex
+  :init-state (cons () ())
+  :indent-line c-indent-line
+  :electric-chars '("{" "}" ":" "#")
+  :electric-anywhere :t
+  :format-buffer c-format-buffer
+  :comment-start "// "
+  :pairs '(("(" . ")") ("[" . "]") ("{" . "}") ("\"" . "\"") ("'" . "'"))
+  :word-chars "_"
+  :input-method "tex"
+  :input-method-context c-in-comment-or-string-p
+  :vars '((tab-width . 8) (indent-tabs-mode . ())))

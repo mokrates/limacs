@@ -1,0 +1,200 @@
+;; -*- limo -*-
+;; limacs/modes/limo.limo --- major mode for editing limo (Lisp) source.
+;;
+;; Scanner state:  (SMODE . STACK)
+;;   SMODE  nil | string | (comment . depth)
+;;   STACK  list of open brackets, innermost first, each (line col char)
+
+(setq *limo-special-forms*
+  (set-of '("defun" "defmacro" "lambda" "macro" "setq" "setf" "if" "cond" "when" "unless" "let" "let*" "progn"
+            "while" "for-each" "for-list" "define" "quote" "quasiquote" "try" "finally" "throw" "block"
+            "return-from" "switch" "defclass" "defmethod" "defprop" "class" "import" "mod-load" "load" "do"
+            "scope" "unify" "unifyf" "loop" "limo-loop" "with-gensym" "with-file-open" "with-dynamic-env"
+            "dyn-let" "freezeq" "unsetq" "incf" "decf" "setplace" "synchronized" "and" "or" "defhelp"
+            "setmember" "assert" "asserteq" "prog1" "dcons" "defcommand" "define-major-mode" "define-minor-mode")))
+(setq *limo-builtins*
+  (set-of '("car" "cdr" "cons" "list" "append" "reverse" "map" "map1" "filter" "reduce" "nth" "list-length"
+            "string-concat" "string-length" "string-nth" "string-slice" "string-split" "string-join" "ord" "chr"
+            "format" "repr" "print" "write" "dict" "make-dict" "dict-get" "dict-set" "dict-has-key" "dict-to-list"
+            "eq" "not" "numberp" "stringp" "symbolp" "consp" "dictp" "mod" "idiv" "apply" "eval" "sort"
+            "cadr" "cddr" "caar" "cdar" "caddr" "member" "assoc" "range" "mrange" "mdrange" "setcar" "setcdr"
+            "make-vector" "vector-ref" "vector-set" "file-open" "file-close" "file-read" "file-write" "regex-match"
+            "list-to-string" "string-to-list" "read-string" "env-getq" "env-setq" "make-env" "exit" "system")))
+(setq *limo-def-forms* (set-of '("defun" "defmacro" "defclass" "defmethod" "define" "defcommand" "define-major-mode" "define-minor-mode" "defhelp")))
+(setq *limo-indent-table* (make-dict))
+(defun limo-put-indent (name n) (dput *limo-indent-table* name n))
+(for-each p '(("defun" . 2) ("defmacro" . 2) ("lambda" . 1) ("macro" . 1) ("let" . 1) ("let*" . 1) ("if" . 2)
+              ("when" . 1) ("unless" . 1) ("while" . 1) ("for-each" . 2) ("for-list" . 2) ("block" . 1) ("switch" . 1)
+              ("with-gensym" . 2) ("with-file-open" . 3) ("defclass" . 2) ("defmethod" . 2) ("define" . 1)
+              ("try" . 0) ("progn" . 0) ("scope" . 0) ("finally" . 0) ("dyn-let" . 1) ("do" . 2) ("loop" . 1)
+              ("class" . 1) ("synchronized" . 1) ("with-dynamic-env" . 0) ("defcommand" . 3) ("unify" . 1)
+              ("define-major-mode" . 3) ("define-minor-mode" . 2) ("defhelp" . 1) ("defprop" . 2))
+  (limo-put-indent (car p) (cdr p)))
+
+(defun limo-delim-p (c) (or (ws-char-p c) (eq c "(") (eq c ")") (eq c "[") (eq c "]") (eq c "\"") (eq c ";")))
+
+(defun limo-number-p (tok) (re-test "^[-+]?[0-9]+([./][0-9]+)?([eE][-+]?[0-9]+)?$" tok))
+
+(defun limo-scan-line (line state)
+  (let* ((smode (car state)) (stack (cdr state)) (n (slen line)) (i 0) (acc ())
+         (lineno *scan-line-no*) (lheads ()))          ; lheads: heads of lists opened on this line (head . argn)
+    (while (< i n)
+      (cond
+       ;; inside a string
+       ((eq smode 'string)
+        (let ((j i) (closed ()))
+          (while (and (< j n) (not closed))
+            (cond ((eq (sref line j) "\\") (setf j (+ j 2)))
+                  ((eq (sref line j) "\"") (setf closed :t) (setf j (+ j 1)))
+                  (:else (setf j (+ j 1)))))
+          (setf j (imin j n))
+          (setf acc (span-list-add acc i j 'string))
+          (when closed (setf smode ()))
+          (setf i j)))
+       ;; inside #| ... |#
+       ((consp smode)
+        (let ((depth (cdr smode)) (j i))
+          (while (and (< j n) (> depth 0))
+            (cond ((and (eq (sref line j) "|") (< (+ j 1) n) (eq (sref line (+ j 1)) "#")) (setf depth (- depth 1)) (setf j (+ j 2)))
+                  ((and (eq (sref line j) "#") (< (+ j 1) n) (eq (sref line (+ j 1)) "|")) (setf depth (+ depth 1)) (setf j (+ j 2)))
+                  (:else (setf j (+ j 1)))))
+          (setf acc (span-list-add acc i j 'comment))
+          (setf smode (if (> depth 0) (cons 'comment depth) ()))
+          (setf i j)))
+       (:else
+        (let ((c (sref line i)))
+          (cond
+           ((eq c ";") (setf acc (span-list-add acc i n 'comment)) (setf i n))
+           ((eq c "\"") (setf smode 'string) (setf acc (span-list-add acc i (+ i 1) 'string)) (setf i (+ i 1))
+            ;; continue scanning the string body in the next loop turn, but keep the opening quote in the same span
+            (let ((j i) (closed ()))
+              (while (and (< j n) (not closed))
+                (cond ((eq (sref line j) "\\") (setf j (+ j 2)))
+                      ((eq (sref line j) "\"") (setf closed :t) (setf j (+ j 1)))
+                      (:else (setf j (+ j 1)))))
+              (setf j (imin j n))
+              (setf acc (span-list-add acc i j 'string))
+              (when closed (setf smode ()))
+              (setf i j)))
+           ((and (eq c "#") (< (+ i 1) n) (eq (sref line (+ i 1)) "|"))
+            (setf smode (cons 'comment 1)) (setf i (+ i 2))
+            (setf acc (span-list-add acc (- i 2) i 'comment)))
+           ((or (eq c "(") (eq c "["))
+            (setf stack (cons (list lineno i c) stack))
+            (setf lheads (cons (cons () 0) lheads))
+            (setf i (+ i 1)))
+           ((or (eq c ")") (eq c "]"))
+            (when stack (setf stack (cdr stack)))
+            (when lheads (setf lheads (cdr lheads)))
+            (setf i (+ i 1)))
+           ((or (eq c "'") (eq c "`") (eq c ","))
+            (let ((e (if (and (eq c ",") (< (+ i 1) n) (eq (sref line (+ i 1)) "@")) (+ i 2) (+ i 1))))
+              (setf acc (span-list-add acc i e 'quote)) (setf i e)))
+           ((ws-char-p c) (setf i (+ i 1)))
+           (:else                                           ; an atom
+            (let ((j i))
+              (while (and (< j n) (not (limo-delim-p (sref line j)))) (setf j (+ j 1)))
+              (let* ((tok (substr line i j)) (face ()) (top (if lheads (car lheads) ())))
+                (cond ((eq (sref tok 0) ":") (setf face 'constant))
+                      ((limo-number-p tok) (setf face 'number))
+                      ((and top (eq (cdr top) 0) (> (car (list 1)) 0) (dhas *limo-special-forms* (str-downcase tok))) (setf face 'keyword))
+                      ((and top (= (cdr top) 1) (car top) (dhas *limo-def-forms* (car top))) (setf face 'function))
+                      ((and top (= (cdr top) 1) (car top) (member (car top) '("setq" "setf"))) (setf face 'variable))
+                      ((and top (= (cdr top) 0) (dhas *limo-builtins* (str-downcase tok))) (setf face 'builtin))
+                      ((dhas *limo-special-forms* (str-downcase tok)) (setf face ()))
+                      (:else ()))
+                (when face (setf acc (span-list-add acc i j face)))
+                ;; bookkeeping for heads / argument counting
+                (when top
+                  (if (= (cdr top) 0)
+                      (setf lheads (cons (cons (str-downcase tok) 1) (cdr lheads)))
+                      (setf lheads (cons (cons (car top) (+ 1 (cdr top))) (cdr lheads)))))
+                (setf i j)))))))))
+    (cons (reverse acc) (cons smode stack))))
+
+(defun limo-skip-regex (state)
+  (let ((sm (car state)))
+    (cond ((eq sm 'string) "\"")
+          ((consp sm) "[|#]")
+          (:else "[][()\";#]"))))
+
+;;; ------------------------------------------------------------------
+;;; indentation
+
+(defun limo-head-at (s start)                          ; symbol starting exactly at START -> (name . end) or nil
+  (let ((n (slen s)))
+    (if (and (< start n) (not (limo-delim-p (sref s start))) (not (eq (sref s start) "'")) (not (eq (sref s start) "`")) (not (eq (sref s start) ",")))
+        (let ((j start)) (while (and (< j n) (not (limo-delim-p (sref s j)))) (setf j (+ j 1)))
+          (cons (substr s start j) j))
+        ())))
+
+(defun limo-count-elements (ol from l)                 ; elements at depth 0 between (ol,from) and the start of line L
+  (let ((count 0) (depth 0) (ln ol) (c from) (in-atom ()))
+    (while (< ln l)
+      (let* ((s (buf-line ln)) (n (slen s)) (stop ()))
+        (while (and (< c n) (not stop))
+          (let ((ch (sref s c)))
+            (cond ((skip-face-p ln c)
+                   (when (and (= depth 0) (not in-atom) (eq ch "\"") (not (skip-face-p ln (imax 0 (- c 1))))) (setf count (+ count 1)))
+                   (when (and (= depth 0) (eq (face-at ln c) 'string) (not in-atom)) (setf in-atom ()))
+                   (setf in-atom ()))
+                  ((eq ch ";") (setf stop :t))
+                  ((or (eq ch "(") (eq ch "[")) (when (= depth 0) (setf count (+ count 1))) (setf depth (+ depth 1)) (setf in-atom ()))
+                  ((or (eq ch ")") (eq ch "]")) (setf depth (- depth 1)) (setf in-atom ()))
+                  ((ws-char-p ch) (setf in-atom ()))
+                  (:else (when (and (= depth 0) (not in-atom) (not (eq ch "'")) (not (eq ch "`")) (not (eq ch ","))) (setf count (+ count 1)) (setf in-atom :t)))))
+          (setf c (+ c 1))))
+      (setf in-atom ())
+      (setf ln (+ ln 1)) (setf c 0))
+    count))
+
+(defun limo-calc-indent (l stack)
+  (let* ((top (car stack)) (ol (car top)) (oc (cadr top)) (och (caddr top))
+         (os (buf-line ol)) (tw (var 'tab-width)) (colo (display-col os oc tw)))
+    (cond
+     ((eq och "[") (+ colo 1))
+     ((and (> oc 0) (eq (sref os (- oc 1)) "'")) (+ colo 1))
+     (:else
+      (let ((head (limo-head-at os (+ oc 1))))
+        (cond
+         ((not head) (+ colo 1))
+         (:else
+          (let* ((name (str-downcase (car head))) (hend (cdr head))
+                 (n-before (limo-count-elements ol hend l))
+                 (special (dget *limo-indent-table* name)))
+            (cond
+             ((dhas *limo-indent-table* name)
+              (if (< n-before special) (+ colo 4) (+ colo 2)))
+             ((and (> (slen os) hend) (not (blank-p (substr-from os hend))) (not (eq (sref (str-trim (substr-from os hend)) 0) ";")))
+              ;; align with the first argument on the head's line
+              (let ((k (+ hend (leading-ws-len (substr-from os hend)))))
+                (display-col os k tw)))
+             (:else (+ colo 1)))))))))))
+
+(defun limo-indent-line ()
+  (let* ((l (point-line)) (st (line-state l)) (smode (car st)) (stack (cdr st)) (s (buf-line l)))
+    (cond ((or (eq smode 'string) (consp smode)) ())
+          ((str-prefix-p ";;;" (str-trim s)) (set-line-indentation l 0))
+          ((not stack) (set-line-indentation l 0))
+          (:else (set-line-indentation l (limo-calc-indent l stack))))))
+
+(defun limo-in-comment-p ()
+  (let ((l (point-line)) (c (point-col)))
+    (or (in-face-p l c '(comment))
+        (let ((st (state-at (point)))) (consp (car st))))))
+
+(define-major-mode limo-mode prog-mode "Limo"
+  :scan-line limo-scan-line
+  :skip-regex limo-skip-regex
+  :init-state (cons () ())
+  :indent-line limo-indent-line
+  :comment-start ";; "
+  :pairs '(("(" . ")") ("[" . "]") ("\"" . "\""))
+  :word-chars "-_?!*<>=+/:"
+  :input-method "tex"
+  :input-method-context limo-in-comment-p
+  :vars '((tab-width . 8) (indent-tabs-mode . ())))
+(define-key limo-mode-map "C-c C-e" 'eval-last-sexp)
+(define-key limo-mode-map "C-c C-b" 'eval-buffer-limo)
+(defcommand eval-buffer-limo () "Evaluate the whole buffer as limo code."
+  (eval-string (buffer-string)) (message "Evaluated %s" (bf name)))

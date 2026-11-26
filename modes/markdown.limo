@@ -1,0 +1,338 @@
+;; -*- limo -*-
+;; limacs/modes/markdown.limo --- major mode for Markdown.
+;;
+;; Scanner state: nil | htmlc | (fence MARKER LANG SUBSTATE)
+;; Fenced code blocks tagged c / limo are highlighted by the C / limo
+;; scanners -- modes composing.
+
+(defun md-fence-scanner (lang)                         ; -> (scanner . init-substate) or nil
+  (let ((l (str-downcase lang)))
+    (cond ((member l '("c" "h" "cpp" "c++")) (cons c-scan-line (cons () ())))
+          ((member l '("limo" "lisp" "scheme" "scm" "el")) (cons limo-scan-line (cons () ())))
+          (:else ()))))
+
+;;; ------------------------------------------------------------------
+;;; inline scanning
+
+(defun md-find-closer (line marker from)               ; index of MARKER at/after FROM not preceded by space
+  (let ((i (str-index line marker from)) (res ()))
+    (while (and i (not res))
+      (if (and (> i from) (not (ws-char-p (sref line (- i 1))))) (setf res i) (setf i (str-index line marker (+ i 1)))))
+    res))
+
+(defun md-inline (line from to base acc)               ; append spans for LINE[from,to) to reversed ACC
+  (let ((i from) (plain-start from))
+    (defun flush (upto) (when (and base (< plain-start upto)) (setf acc (span-list-add acc plain-start upto base))))
+    (defun emit (s e face) (flush s) (setf acc (span-list-add acc s e face)) (setf plain-start e) (setf i e))
+    (while (< i to)
+      (let* ((c (sref line i)) (c2 (if (< (+ i 1) to) (sref line (+ i 1)) "")))
+        (cond
+         ((and (eq c "\\") (< (+ i 1) to)) (emit i (+ i 2) 'escape))
+         ((eq c "`")
+          (let ((j i)) (while (and (< j to) (eq (sref line j) "`")) (setf j (+ j 1)))
+            (let* ((ticks (substr line i j)) (e (str-index line ticks j)))
+              (if (and e (< e to)) (emit i (+ e (slen ticks)) 'code) (setf i j)))))
+         ((and (or (eq c "*") (eq c "_")) (eq c c2))
+          (let* ((m (string-concat c c)) (e (if (and (< (+ i 2) to) (not (ws-char-p (sref line (+ i 2))))) (md-find-closer line m (+ i 2)) ())))
+            (if (and e (< e to)) (emit i (+ e 2) 'bold) (setf i (+ i 2)))))
+         ((and (eq c "~") (eq c2 "~"))
+          (let ((e (md-find-closer line "~~" (+ i 2)))) (if (and e (< e to)) (emit i (+ e 2) 'strike) (setf i (+ i 2)))))
+         ((or (eq c "*") (and (eq c "_") (or (= i 0) (not (ident-char-p (sref line (- i 1)))))))
+          (let ((e (if (and (< (+ i 1) to) (not (ws-char-p c2))) (md-find-closer line c (+ i 1)) ())))
+            (if (and e (< e to) (or (eq c "*") (>= (+ e 1) to) (not (ident-char-p (sref line (+ e 1))))))
+                (emit i (+ e 1) 'italic) (setf i (+ i 1)))))
+         ((or (eq c "[") (and (eq c "!") (eq c2 "[")))
+          (let* ((b (if (eq c "!") (+ i 1) i)) (rb (str-find-char line "]" (+ b 1))))
+            (if (and rb (< (+ rb 1) to) (eq (sref line (+ rb 1)) "("))
+                (let ((rp (str-find-char line ")" (+ rb 2))))
+                  (if rp
+                      (progn (emit i (+ rb 1) 'link) (emit (+ rb 1) (+ rp 1) 'url))
+                      (setf i (+ i 1))))
+                (setf i (+ i 1)))))
+         ((eq c "<")
+          (let ((e (str-find-char line ">" (+ i 1))))
+            (if (and e (< e to) (re-test "^<[a-zA-Z/!][^>]*>$" (substr line i (+ e 1))))
+                (emit i (+ e 1) (if (re-test "^<[a-z]+://" (substr line i (+ e 1))) 'url 'html))
+                (setf i (+ i 1)))))
+         ((and (eq c "h") (or (str-prefix-p "http://" (substr-from line i)) (str-prefix-p "https://" (substr-from line i)))
+               (or (= i 0) (not (ident-char-p (sref line (- i 1))))))
+          (let ((j i)) (while (and (< j to) (not (ws-char-p (sref line j))) (not (member (sref line j) '(")" ">" "\"")))) (setf j (+ j 1)))
+            (emit i j 'url)))
+         (:else (setf i (+ i 1))))))
+    (flush to)
+    acc))
+
+;;; ------------------------------------------------------------------
+;;; block scanning
+
+(defun md-list-match (s) (re-match "^( *)([-*+]|[0-9]+[.)])( +)(\\[[ xX]\\] +)?(.*)$" s 6))
+(defun md-heading-level (s)
+  (let ((m (re-match "^ {0,3}(#{1,6})( .*|)$" s 3))) (if m (slen (cadr m)) ())))
+(defun md-fence-open (s) (re-match "^( {0,3})(```+|~~~+)[ ]*([A-Za-z0-9_+-]*)" s 4))
+
+(defun md-scan-line (line state)
+  (let ((n (slen line)))
+    (cond
+     ;; inside a fenced code block
+     ((and (consp state) (eq (car state) 'fence))
+      (let* ((marker (cadr state)) (lang (caddr state)) (sub (cadddr state))
+             (close (re-match "^ {0,3}(```+|~~~+)[ ]*$" line 2)))
+        (cond ((and close (eq (sref (cadr close) 0) (sref marker 0)) (>= (slen (cadr close)) (slen marker)))
+               (cons (list (list 0 n 'code-fence)) ()))
+              (:else
+               (let ((sc (md-fence-scanner lang)))
+                 (if sc
+                     (let ((r ((car sc) line sub)))
+                       (cons (car r) (list 'fence marker lang (cdr r))))
+                     (cons (if (> n 0) (list (list 0 n 'code)) ()) state)))))))
+     ;; inside <!-- -->
+     ((eq state 'htmlc)
+      (let ((e (str-index line "-->" 0)))
+        (if e (cons (list (list 0 (+ e 3) 'comment)) ()) (cons (if (> n 0) (list (list 0 n 'comment)) ()) 'htmlc))))
+     (:else
+      (let ((fo (md-fence-open line)))
+        (cond
+         (fo (let* ((marker (caddr fo)) (lang (cadddr fo)) (sc (md-fence-scanner lang)))
+               (cons (list (list 0 n 'code-fence)) (list 'fence marker lang (if sc (cdr sc) ())))))
+         ((md-heading-level line)
+          (cons (list (list 0 n (make-sym (string-concat "HEADING" (num->str (md-heading-level line)))))) ()))
+         ((re-test "^ {0,3}([-*_])( *\\1){2,} *$" line) (cons (list (list 0 n 'hr)) ()))
+         ((and (str-prefix-p "<!--" (substr-from line (leading-ws-len line))) (not (str-contains line "-->")))
+          (cons (list (list 0 n 'comment)) 'htmlc))
+         (:else
+          (let ((acc ()) (start 0) (base ()))
+            ;; blockquote markers
+            (let ((q (re-match "^( *(> ?)+)" line 2)))
+              (when q (setf acc (span-list-add acc 0 (slen (cadr q)) 'blockquote)) (setf start (slen (cadr q))) (setf base 'blockquote)))
+            (let ((li (md-list-match (substr-from line start))))
+              (when li
+                (let* ((ind (slen (cadr li))) (mk (slen (caddr li))) (sp (slen (cadddr li))) (cb (nth 4 li))
+                       (ms (+ start ind)))
+                  (setf acc (span-list-add acc ms (+ ms mk) 'list-marker))
+                  (setf start (+ ms mk sp))
+                  (when cb (setf acc (span-list-add acc start (+ start (slen (str-trim cb))) 'list-marker))
+                    (setf start (+ start (slen cb)))))))
+            (when (re-test "^ *\\|" line)
+              (let ((i 0)) (while (< i n) (when (eq (sref line i) "|") (setf acc (span-list-add acc i (+ i 1) 'table))) (setf i (+ i 1)))))
+            (cons (reverse (md-inline line start n base acc)) ())))))))))
+
+(defun md-skip-regex (state)
+  (cond ((not state) "^ {0,3}(```|~~~)|<!--")
+        ((eq state 'htmlc) "-->")
+        ((md-fence-scanner (caddr state)) ())
+        (:else "^ {0,3}(```|~~~)")))
+(defun md-spans-sorted (spans) spans)
+
+;;; ------------------------------------------------------------------
+;;; lists: indentation & continuation
+
+(defun md-list-info (l)                               ; (indent marker-text content-col ordered-number) or nil
+  (let ((m (md-list-match (buf-line l))))
+    (if m (list (slen (cadr m)) (caddr m) (+ (slen (cadr m)) (slen (caddr m)) (slen (cadddr m)))
+                (if (re-test "^[0-9]+" (caddr m)) (str->num (car (re-match "^[0-9]+" (caddr m) 1))) ())
+                (nth 4 m) (nth 5 m))
+        ())))
+(defun md-in-fence-p (l) (let ((st (car (list (line-state l))))) (and (consp st) (eq (car st) 'fence))))
+
+(defun md-indent-line ()
+  (let* ((l (point-line)) (s (buf-line l)) (cur (line-indentation l)) (info (md-list-info l)))
+    (cond
+     ((md-in-fence-p l) (default-indent-line))
+     (info
+      ;; cycle through plausible nesting levels
+      (let ((levels (list 0)) (k (- l 1)) (prev-content ()))
+        (while (and (>= k 0) (< (list-length levels) 12))
+          (let ((pi (md-list-info k)))
+            (when pi
+              (unless prev-content (setf prev-content (caddr pi)))
+              (unless (member (car pi) levels) (setf levels (cons (car pi) levels)))))
+          (setf k (- k 1)))
+        (when (and prev-content (not (member prev-content levels))) (setf levels (cons prev-content levels)))
+        (let* ((sorted (sort < levels)) (next (car (filter (lambda (x) (> x cur)) sorted))))
+          (set-line-indentation l (or next 0)))))
+     (:else
+      (let ((k (- l 1)) (target 0))
+        (while (and (>= k 0) (blank-p (buf-line k))) (setf k (- k 1)))
+        (when (and (>= k 0) (= k (- l 1)))
+          (let ((pi (md-list-info k))) (setf target (if pi (caddr pi) (line-indentation k)))))
+        (if (< cur target) (set-line-indentation l target)
+            (if (and (= cur target) (> target 0)) (set-line-indentation l 0) (set-line-indentation l target))))))))
+
+(defun md-next-marker (info)                           ; marker for the item after INFO
+  (let ((m (cadr info)) (num (cadddr info)))
+    (cond (num (string-concat (num->str (+ num 1)) (substr-from m (slen (num->str num)))))
+          (:else m))))
+
+(defun md-newline ()
+  (let* ((l (point-line)) (c (point-col)) (s (buf-line l)) (info (md-list-info l)) (q (re-match "^( *(> ?)+)" s 2)))
+    (cond
+     ((and (md-in-fence-p l)) (default-newline))
+     ((and info (>= c (caddr info)))
+      (cond ((blank-p (or (nth 5 info) ""))                    ; empty item: end the list
+             (delete-between (cons l 0) (cons l (slen s)))
+             (insert "\n"))
+            (:else
+             (let* ((box (if (and (nth 4 info) (> (slen (nth 4 info)) 0)) "[ ] " "")) (prefix (string-concat (spaces (car info)) (md-next-marker info) (spaces (- (caddr info) (car info) (slen (cadr info)))) box)))
+               (delete-between (cons l (cdr (cons 0 (let ((e c)) (while (and (> e 0) (ws-char-p (sref s (- e 1)))) (setf e (- e 1))) e)))) (cons l c))
+               (insert (string-concat "\n" prefix))))))
+     ((and q (>= c (slen (cadr q))))
+      (if (blank-p (substr-from s (slen (cadr q))))
+          (progn (delete-between (cons l 0) (cons l (slen s))) (insert "\n"))
+          (insert (string-concat "\n" (cadr q)))))
+     (:else (default-newline)))))
+
+(defun md-fill-prefix (line)                           ; (first-line-prefix . continuation-prefix)
+  (let ((q (re-match "^( *(> ?)+)" line 2)) (li (md-list-match line)))
+    (cond (q (cons (cadr q) (cadr q)))
+          (li (let ((p (+ (slen (cadr li)) (slen (caddr li)) (slen (cadddr li)))))
+                (cons (substr line 0 p) (spaces p))))
+          (:else (let ((ws (substr line 0 (leading-ws-len line)))) (cons ws ws))))))
+(defun md-paragraph-start (prev l)
+  (let ((s (buf-line l)))
+    (or (md-list-match s) (md-heading-level s) (re-test "^ *\\|" s) (md-fence-open s) (re-test "^ {0,3}([-*_])( *\\1){2,} *$" s))))
+
+;;; ------------------------------------------------------------------
+;;; formatting
+
+(defun md-table-row-p (s) (re-test "^ *\\|" s))
+(defun md-split-cells (s)
+  (let* ((t1 (str-trim s)) (cells ()) (cur ()) (i 0) (n (slen t1)))
+    (when (str-prefix-p "|" t1) (setf i 1))
+    (when (and (> n 1) (str-suffix-p "|" t1) (not (str-suffix-p "\\|" t1))) (setf n (- n 1)))
+    (let ((start i))
+      (while (< i n)
+        (cond ((eq (sref t1 i) "\\") (setf i (+ i 2)))
+              ((eq (sref t1 i) "|") (setf cells (cons (str-trim (substr t1 start i)) cells)) (setf i (+ i 1)) (setf start i))
+              (:else (setf i (+ i 1)))))
+      (setf cells (cons (str-trim (substr t1 start (imin n (slen t1)))) cells)))
+    (reverse cells)))
+(defun md-sep-cell-p (c) (re-test "^:?-+:?$" c))
+
+(defun md-format-table (rows)                           ; list of row strings -> aligned row strings
+  (let* ((cells (map1 md-split-cells rows)) (ncols (apply imax-list (map1 list-length cells)))
+         (widths ()) (aligns ()))
+    (for-each j (mdrange ncols)
+      (let ((w 3) (al 'left))
+        (for-each r cells
+          (let ((c (if (< j (list-length r)) (nth j r) "")))
+            (if (md-sep-cell-p c)
+                (setf al (cond ((and (str-prefix-p ":" c) (str-suffix-p ":" c)) 'center) ((str-suffix-p ":" c) 'right) ((str-prefix-p ":" c) 'left) (:else 'none)))
+                (setf w (imax w (u8-length c))))))
+        (setf widths (append widths (list w))) (setf aligns (append aligns (list al)))))
+    (map1 (lambda (r)
+            (let ((out ()))
+              (for-each j (mdrange ncols)
+                (let* ((c (if (< j (list-length r)) (nth j r) "")) (w (nth j widths)) (al (nth j aligns)))
+                  (setf out (cons
+                             (cond ((md-sep-cell-p c)
+                                    (cond ((eq al 'center) (string-concat ":" (str-repeat "-" (- w 2)) ":"))
+                                          ((eq al 'right) (string-concat (str-repeat "-" (- w 1)) ":"))
+                                          ((eq al 'left) (if (str-prefix-p ":" c) (string-concat ":" (str-repeat "-" (- w 1))) (str-repeat "-" w)))
+                                          (:else (str-repeat "-" w))))
+                                   ((eq al 'right) (string-concat (spaces (- w (u8-length c))) c))
+                                   ((eq al 'center) (let* ((pad (- w (u8-length c))) (l1 (idiv pad 2))) (string-concat (spaces l1) c (spaces (- pad l1)))))
+                                   (:else (string-concat c (spaces (- w (u8-length c))))))
+                             out))))
+              (string-concat "| " (string-join* " | " (reverse out)) " |")))
+          cells)))
+(defun imax-list xs (let ((m 0)) (for-each x xs (when (> x m) (setf m x))) m))
+
+(defun md-format-buffer ()
+  (let* ((n (buf-nlines)) (lines (buf-lines-list 0 n)) (in-code (make-vector (+ n 1))) (k 0))
+    ;; which lines are code (inside or on a fence)?
+    (while (< k n)
+      (let ((st (car (list (line-state k)))))
+        (vector-set in-code k (or (and (consp st) (eq (car st) 'fence)) (md-fence-open (buf-line k)))))
+      (setf k (+ k 1)))
+    (let ((out ()) (i 0) (counters (make-dict)) (lastblank :t))
+      (while (< i n)
+        (let ((s (nth-line lines i)))
+          (cond
+           ((vector-ref in-code i) (setf out (cons s out)) (setf lastblank ()) (setf i (+ i 1)))
+           ((md-table-row-p s)
+            (let ((j i) (rows ()))
+              (while (and (< j n) (not (vector-ref in-code j)) (md-table-row-p (nth-line lines j)))
+                (setf rows (cons (nth-line lines j) rows)) (setf j (+ j 1)))
+              (for-each r (md-format-table (reverse rows)) (setf out (cons r out)))
+              (setf lastblank ()) (setf i j)))
+           ((blank-p s) (unless lastblank (setf out (cons "" out))) (setf lastblank :t) (dict-clear-counters counters) (setf i (+ i 1)))
+           (:else
+            (let ((s1 s) (li (md-list-match s)) (hl (md-heading-level s)))
+              ;; trailing whitespace: keep a two-space hard break
+              (setf s1 (if (re-test "[^ ]  +$" s1) (string-concat (str-trim-right s1) "  ") (str-trim-right s1)))
+              (when hl (unless (or lastblank) (setf out (cons "" out))))
+              (when li
+                (let* ((ind (slen (cadr li))) (key (num->str ind)) (marker (caddr li)) (rest (substr-from s1 (+ ind (slen marker)))))
+                  (cond ((re-test "^[0-9]+[.)]$" marker)
+                         (let* ((num (if (dhas counters key) (dget counters key) (str->num (car (re-match "^[0-9]+" marker 1)))))
+                                (delim (substr marker (- (slen marker) 1) (slen marker))))
+                           (dput counters key (+ num 1))
+                           (setf s1 (string-concat (cadr li) (num->str num) delim rest))))
+                        (:else (when (dhas counters key) (dict-unset counters key))
+                               (when (var 'markdown-normalize-bullets) (setf s1 (string-concat (cadr li) "-" rest)))))
+                  (for-each kk (dkeys counters) (when (> (str->num kk) ind) (dict-unset counters kk)))))
+              (unless (or li (> (leading-ws-len s1) 1)) (dict-clear-counters counters))
+              (setf out (cons s1 out)) (setf lastblank ())
+              (when (and hl (< (+ i 1) n) (not (blank-p (nth-line lines (+ i 1))))) (setf out (cons "" out)) (setf lastblank :t))
+              (setf i (+ i 1)))))))
+      (let ((new (join-lines (reverse out))) (old (buffer-string)))
+        (unless (eq new old)
+          (let ((pt (point)))
+            (delete-between (buffer-start) (buffer-end))
+            (insert-at (cons 0 0) new)
+            (set-point pt))))))
+  (trim-trailing-blank-lines))
+(defun nth-line (lines i) (nth i lines))
+(defun dict-clear-counters (d) (for-each k (dkeys d) (dict-unset d k)))
+(defun trim-trailing-blank-lines ()
+  (while (and (> (buf-nlines) 1) (blank-p (buf-line (- (buf-nlines) 1))) (blank-p (buf-line (- (buf-nlines) 2))))
+    (delete-between (line-end-pos (- (buf-nlines) 3)) (line-end-pos (- (buf-nlines) 2)))))
+
+(defvar* 'markdown-normalize-bullets :t)
+
+;;; ------------------------------------------------------------------
+;;; misc commands
+
+(defcommand markdown-toggle-checkbox () "Toggle the task-list checkbox on this line."
+  (let* ((l (point-line)) (s (buf-line l)))
+    (cond ((re-test "^ *[-*+] \\[ \\]" s) (let ((i (str-index s "[ ]" 0))) (replace-line l (string-concat (substr s 0 i) "[x]" (substr-from s (+ i 3))))))
+          ((re-test "^ *[-*+] \\[[xX]\\]" s) (let ((i (str-index (str-downcase s) "[x]" 0))) (replace-line l (string-concat (substr s 0 i) "[ ]" (substr-from s (+ i 3))))))
+          ((md-list-match s) (let ((li (md-list-info l))) (replace-line l (string-concat (substr s 0 (+ (car li) (slen (cadr li)) 1)) "[ ] " (substr-from s (+ (car li) (slen (cadr li)) 1))))))
+          (:else (user-error "Not on a list item")))))
+(defcommand markdown-align-table () "Align the pipe table at point."
+  (let ((a (point-line)) (b (point-line)))
+    (unless (md-table-row-p (buf-line a)) (user-error "Not in a table"))
+    (while (and (> a 0) (md-table-row-p (buf-line (- a 1)))) (setf a (- a 1)))
+    (while (and (< (+ b 1) (buf-nlines)) (md-table-row-p (buf-line (+ b 1)))) (setf b (+ b 1)))
+    (let* ((rows (md-format-table (buf-lines-list a (+ b 1)))) (pt (point)))
+      (delete-between (cons a 0) (line-end-pos b))
+      (insert-at (cons a 0) (join-lines rows))
+      (set-point (cons (car pt) 0)) (set-point (line-end-pos (car pt))))))
+(defcommand markdown-insert-heading () "Insert a heading marker, cycling the level."
+  (let* ((l (point-line)) (s (buf-line l)) (lv (md-heading-level s)))
+    (cond ((not lv) (replace-line l (string-concat "# " s)))
+          ((>= lv 6) (replace-line l (substr-from s (+ lv 1))))
+          (:else (replace-line l (string-concat "#" s))))))
+
+(defun md-input-context ()
+  (let ((st (state-at (point))))
+    (and (not (consp st)) (not (eq st 'htmlc))
+         (not (in-face-p (point-line) (point-col) '(code code-fence comment url))))))
+
+(define-major-mode markdown-mode text-mode "Markdown"
+  :scan-line md-scan-line
+  :skip-regex md-skip-regex
+  :indent-line md-indent-line
+  :newline md-newline
+  :format-buffer md-format-buffer
+  :fill-prefix md-fill-prefix
+  :paragraph-start md-paragraph-start
+  :comment-start "<!-- "
+  :comment-end " -->"
+  :pairs '(("(" . ")") ("[" . "]") ("\"" . "\"") ("`" . "`"))
+  :input-method "tex"
+  :input-method-context md-input-context
+  :vars '((tab-width . 4) (fill-column . 78) (indent-tabs-mode . ())))
+(define-key markdown-mode-map "C-c C-t" 'markdown-toggle-checkbox)
+(define-key markdown-mode-map "C-c C-a" 'markdown-align-table)
+(define-key markdown-mode-map "C-c C-h" 'markdown-insert-heading)

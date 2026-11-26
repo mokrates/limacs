@@ -1,0 +1,78 @@
+;; -*- limo -*-
+;; limacs/lib/syntax.limo --- per-line syntax state cache and highlight spans.
+;;
+;; A mode supplies (:scan-line fn).  FN takes a line's text and the scanner
+;; state at the start of that line and returns (spans . end-state).
+;; SPANS is a list of (start end face) with byte offsets, sorted.  The
+;; state is an arbitrary value (e.g. "inside a block comment" plus a stack
+;; of open brackets); limacs caches one state per line and only recomputes
+;; from the first line that changed.
+
+(setq *scan-mutex* ())                   ; guards *scan-line-no* between the UI thread and the syntax worker
+(defmacro with-scan-lock body
+  `(if *scan-mutex* (synchronized *scan-mutex* ,@body) (progn ,@body)))
+(defun scan-locked (scan text st n)     ; (spans . end-state) for one line
+  (with-scan-lock (setf *scan-line-no* n) (scan text st)))
+
+(setq *spans-version* 0)                 ; bumped whenever cached spans are (re)written: invalidates whole-frame cache
+(setq *scan-line-no* 0)    ; line number of the line being scanned (for scanners that record positions)
+
+(defun ensure-syntax-capacity ()
+  (let ((n (+ (buf-nlines) 2)))
+    (when (< (vector-len (bf states)) n)
+      (let ((cap (* 2 n)))
+        (bf! states (make-vector cap))
+        (bf! spans (make-vector cap))
+        (bf! spans-key (make-vector cap))
+        (bf! valid 0)))))
+
+(defun line-state (n)                            ; scanner state at start of line N
+  (let ((scan (buffer-prop ':scan-line)))
+    (cond ((not scan) ())
+          (:else
+           (ensure-syntax-capacity)
+           (when (= (bf valid) 0)
+             (vector-set (bf states) 0 (buffer-prop ':init-state))
+             (bf! valid 1))
+           (let ((skipf (buffer-prop ':skip-regex)) (v (bf states)))
+             (while (<= (bf valid) n)
+               (let* ((i (- (bf valid) 1)) (st (vector-ref v i)) (text (buf-line i))
+                      (rx (if skipf (skipf st) ())))
+                 (vector-set v (bf valid)
+                             (if (and rx (not (re-test rx text)))
+                                 st
+                                 (cdr (scan-locked scan text st i))))
+                 (bf! valid (+ (bf valid) 1))))
+             (vector-ref v n))))))
+
+(defun line-spans (n)                            ; highlight spans of line N (cached)
+  (let ((scan (buffer-prop ':scan-line)))
+    (cond ((not scan) ())
+          (:else
+           (let* ((st (line-state n)) (text (buf-line n)) (key (vector-ref (bf spans-key) n)))
+             (if (and key (eq (car key) text) (deepeq (cdr key) st))
+                 (vector-ref (bf spans) n)
+                 (let ((r (scan-locked scan text st n)))
+                   (setf *spans-version* (+ *spans-version* 1))
+                   (vector-set (bf spans) n (car r))
+                   (vector-set (bf spans-key) n (cons text st))
+                   (car r))))))))
+
+;; state of the scanner at an arbitrary position: scan the line up to COL
+(defun state-at (p)
+  (let ((scan (buffer-prop ':scan-line)))
+    (if (not scan) ()
+        (let ((st (line-state (car p)))) (cdr (scan-locked scan (substr (buf-line (car p)) 0 (cdr p)) st (car p)))))))
+
+;; face under point-ish positions (useful for modes: "am I in a comment?")
+(defun face-at (l c)
+  (let ((res ()))
+    (for-each sp (line-spans-view l)            ; soft: never blocks on the background scanner
+      (when (and (<= (car sp) c) (< c (cadr sp))) (setf res (caddr sp))))
+    res))
+(defun in-face-p (l c faces)                     ; is the char before col C in one of FACES?
+  (and (> c 0) (member (face-at l (- c 1)) faces) :t))
+
+;;; generic scanner helpers (used by the language modes)
+(defun span-list-add (acc s e face)               ; accumulate reversed
+  (if (< s e) (cons (list s e face) acc) acc))

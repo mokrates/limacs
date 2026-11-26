@@ -1,0 +1,342 @@
+;; -*- limo -*-
+;; limacs/lib/buffer.limo --- buffers, editing primitives, undo, hooks, variables.
+;;
+;; A buffer is a dict.  Text is a vector of lines (strings without "\n").
+;; A position is (line . col) with col a *byte* offset into the line.
+
+(setq *cb* ())               ; current buffer
+(setq *buffers* ())          ; all buffers, most recently used first
+(setq *vars* (make-dict))    ; global editor variables
+(setq *hooks* (make-dict))   ; hook name -> list of functions
+
+(defmacro bf (k) `(dget *cb* ',k))
+(defmacro bf! (k v) `(dput *cb* ',k ,v))
+(defun buf-get (b k) (dget b k))
+(defun buf-put (b k v) (dput b k v))
+
+;;; ------------------------------------------------------------------
+;;; hooks
+
+(defun add-hook (name fn)
+  (let ((l (dget *hooks* name)))
+    (unless (member fn l) (dput *hooks* name (append l (list fn))))
+    fn))
+(defun remove-hook (name fn) (dput *hooks* name (remove-item fn (dget *hooks* name))))
+(defun run-hook (name . args)
+  (let ((l (dget *hooks* name)))
+    (for-each f l (apply f args))))
+
+;;; ------------------------------------------------------------------
+;;; variables: buffer-local first, then global default
+
+(defun defvar* (name default)
+  (unless (dhas *vars* name) (dput *vars* name default))
+  name)
+(defun var (name)
+  (let ((loc (if *cb* (bf locals) ())))
+    (cond ((and loc (dhas loc name)) (dget loc name))
+          (:else (dget *vars* name)))))
+(defun set-var (name v) (dput *vars* name v))               ; global default
+(defun set-var-local (name v) (dput (bf locals) name v))    ; this buffer only
+(defun kill-var-local (name) (dict-unset (bf locals) name))
+
+;; Display the current buffer's tab width, etc.
+(defvar* 'tab-width 8)
+(defvar* 'indent-tabs-mode ())
+(defvar* 'fill-column 72)
+(defvar* 'require-final-newline :t)
+
+;;; ------------------------------------------------------------------
+;;; vector of lines
+
+(defun vec-fill-range (v a b x)
+  (let ((i a)) (while (< i b) (vector-set v i x) (setf i (+ i 1)))))
+
+(defun buf-ensure-capacity (need)
+  (let ((v (bf lines)))
+    (when (> need (vector-len v))
+      (let* ((cap (imax need (* 2 (vector-len v)))) (nv (make-vector cap)) (i 0) (n (bf nlines)))
+        (while (< i n) (vector-set nv i (vector-ref v i)) (setf i (+ i 1)))
+        (bf! lines nv)))))
+
+(defun buf-nlines () (bf nlines))
+(defun buf-line (n) (vector-ref (bf lines) n))
+(defun buf-set-line (n s) (vector-set (bf lines) n s))
+(defun buf-line-length (n) (string-length (buf-line n)))
+(defun buf-lines-list (a b)                      ; lines [a,b) as list
+  (let ((res ()) (i (- b 1)))
+    (while (>= i a) (setf res (cons (buf-line i) res)) (setf i (- i 1)))
+    res))
+
+(defun raw-replace-lines (a b new)                ; replace lines [a,b) with list NEW
+  (let* ((k (list-length new)) (delta (- k (- b a))) (n (bf nlines)) (v ()) (i 0))
+    (buf-ensure-capacity (+ n delta 1))
+    (setf v (bf lines))
+    (cond ((> delta 0)
+           (setf i (- n 1))
+           (while (>= i b) (vector-set v (+ i delta) (vector-ref v i)) (setf i (- i 1))))
+          ((< delta 0)
+           (setf i b)
+           (while (< i n) (vector-set v (+ i delta) (vector-ref v i)) (setf i (+ i 1)))))
+    (setf i a)
+    (for-each s new (vector-set v i s) (setf i (+ i 1)))
+    (bf! nlines (+ n delta))))
+
+;;; ------------------------------------------------------------------
+;;; buffers
+
+(defun make-buffer-record (name)
+  (let ((b (make-dict)))
+    (dput b 'name name) (dput b 'file ())
+    (dput b 'lines (make-vector 64)) (dput b 'nlines 1)
+    (vector-set (dget b 'lines) 0 "")
+    (dput b 'pt (cons 0 0)) (dput b 'goal ())
+    (dput b 'mark ()) (dput b 'mark-active ())
+    (dput b 'modified ()) (dput b 'readonly ()) (dput b 'tick 0)
+    (dput b 'major ()) (dput b 'minors ()) (dput b 'locals (make-dict))
+    (dput b 'undo ()) (dput b 'redo ()) (dput b 'undo-open ()) (dput b 'undo-count 0)
+    (dput b 'states (make-vector 64)) (dput b 'valid 0)
+    (dput b 'spans (make-vector 64)) (dput b 'spans-key (make-vector 64))
+    (dput b 'top 0) (dput b 'hscroll 0)
+    (dput b 'overlays (make-dict))
+    (dput b 'im ()) (dput b 'im-state ())
+    b))
+
+(defun get-buffer (name)
+  (let ((res ()))
+    (for-each b *buffers* (when (eq (dget b 'name) name) (setf res b)))
+    res))
+(defun set-buffer (b)
+  (setf *cb* b)
+  (setf *buffers* (cons b (remove-item b *buffers*)))
+  b)
+(defun create-buffer (name)
+  (let ((b (make-buffer-record name)))
+    (setf *buffers* (append *buffers* (list b)))
+    b))
+(defun get-buffer-create (name) (or (get-buffer name) (create-buffer name)))
+(defun unique-buffer-name (name)
+  (if (not (get-buffer name)) name
+      (let ((i 2) (res ()))
+        (while (not res)
+          (let ((cand (string-concat name "<" (num->str i) ">")))
+            (if (get-buffer cand) (setf i (+ i 1)) (setf res cand))))
+        res)))
+
+(defmacro with-buffer (b . body)
+  (with-gensym (old)
+    `(let ((,old *cb*))
+       (setf *cb* ,b)
+       (finally (progn ,@body) (setf *cb* ,old)))))
+
+(defun buffer-name () (bf name))
+
+;;; ------------------------------------------------------------------
+;;; point & mark
+
+(defun point () (bf pt))
+(defun point-line () (car (bf pt)))
+(defun point-col () (cdr (bf pt)))
+(defun clamp-pos (p)
+  (let* ((l (imax 0 (imin (car p) (- (buf-nlines) 1))))
+         (c (imax 0 (imin (cdr p) (buf-line-length l)))))
+    (cons l c)))
+(defun set-point (p) (bf! pt (clamp-pos p)))
+(defun goto-pos (l c) (set-point (cons l c)))
+(defun buffer-start () (cons 0 0))
+(defun buffer-end () (let ((l (- (buf-nlines) 1))) (cons l (buf-line-length l))))
+(defun point-min-p () (pos= (point) (buffer-start)))
+(defun point-max-p () (pos= (point) (buffer-end)))
+(defun current-line-text () (buf-line (point-line)))
+(defun mark () (bf mark))
+(defun set-mark (p) (bf! mark p) (bf! mark-active :t))
+(defun deactivate-mark () (bf! mark-active ()))
+(defun region-active-p () (and (bf mark-active) (bf mark) :t))
+(defun region-bounds ()
+  (let ((a (point)) (b (bf mark)))
+    (if (pos< a b) (cons a b) (cons b a))))
+
+;;; ------------------------------------------------------------------
+;;; text extraction
+
+(defun end-pos-after (p text)                      ; where inserting TEXT at P ends
+  (let ((parts (split-lines text)))
+    (if (cdr parts)
+        (cons (+ (car p) (- (list-length parts) 1)) (slen (car (last-cons parts))))
+        (cons (car p) (+ (cdr p) (slen text))))))
+
+(defun buffer-substring (p1 p2)
+  (let ((a (pos-min p1 p2)) (b (pos-max p1 p2)))
+    (cond ((= (car a) (car b)) (substr (buf-line (car a)) (cdr a) (cdr b)))
+          (:else
+           (let ((res (list (substr-from (buf-line (car a)) (cdr a)))) (i (+ (car a) 1)))
+             (while (< i (car b))
+               (setf res (cons (buf-line i) (cons "\n" res)))
+               (setf i (+ i 1)))
+             (setf res (cons (substr (buf-line (car b)) 0 (cdr b)) (cons "\n" res)))
+             (list-to-string (reverse res)))))))
+(defun buffer-string () (buffer-substring (buffer-start) (buffer-end)))
+(defun line-string (n) (buf-line n))
+
+;;; ------------------------------------------------------------------
+;;; undo bookkeeping.  *rec-target* is 'undo normally; while performing an
+;;; undo it is 'redo and vice versa.
+
+(setq *rec-target* 'undo)
+
+(defun undo-boundary () (bf! undo-open ()) (bf! undo-count 0))
+
+(defun record-change (entry)
+  (cond ((eq *rec-target* 'undo)
+         (let ((u (bf undo)))
+           (cond ((and (bf undo-open) u (< (bf undo-count) 40))
+                  (setcar u (cons entry (car u))))
+                 (:else (bf! undo (cons (list entry) u)) (bf! undo-open :t) (bf! undo-count 0)))
+           (bf! undo-count (+ 1 (bf undo-count))))
+         (unless (eq *rec-target* 'redo-skip) (when (not *in-undo*) (bf! redo ()))))
+        (:else
+         (let ((r (bf redo)))
+           (setcar r (cons entry (car r)))))))
+(setq *in-undo* ())
+
+;;; adjust a remembered position after an edit
+(defun adjust-ins (p at end)
+  (cond ((not p) p)
+        ((pos<= p at) p)
+        ((= (car p) (car at)) (cons (car end) (+ (cdr end) (- (cdr p) (cdr at)))))
+        (:else (cons (+ (car p) (- (car end) (car at))) (cdr p)))))
+(defun adjust-del (p a b)
+  (cond ((not p) p)
+        ((pos<= p a) p)
+        ((pos<= p b) a)
+        ((= (car p) (car b)) (cons (car a) (+ (cdr a) (- (cdr p) (cdr b)))))
+        (:else (cons (- (car p) (- (car b) (car a))) (cdr p)))))
+
+(setq *syn-epoch* 0)                       ; bumped whenever cached syntax data may be invalid (async jobs check it)
+(defun syn-bump () (setf *syn-epoch* (+ *syn-epoch* 1)))
+
+(defun note-change (l)
+  ;; text from line L on may have different syntax state now
+  (bf! valid (imin (bf valid) (+ l 1)))
+  (syn-bump)
+  (bf! tick (+ 1 (bf tick)))
+  (bf! modified :t))
+
+(defun check-writable ()
+  (when (bf readonly) (throw (list 'buffer-read-only (bf name)))))
+
+;;; ------------------------------------------------------------------
+;;; the two primitives every edit goes through
+
+(defun insert-at (p text)
+  (check-writable)
+  (when (= (slen text) 0) (return-from-noop p))
+  (let* ((parts (split-lines text)) (l (car p)) (c (cdr p)) (line (buf-line l))
+         (pre (substr line 0 c)) (post (substr-from line c)) (end ()))
+    (cond ((not (cdr parts))
+           (buf-set-line l (list-to-string (list pre text post)))
+           (setf end (cons l (+ c (slen text)))))
+          (:else
+           (let* ((n (list-length parts)) (new ()) (i 0))
+             (for-each x parts
+               (cond ((= i 0) (setf new (cons (string-concat pre x) new)))
+                     ((= i (- n 1)) (setf new (cons (string-concat x post) new)))
+                     (:else (setf new (cons x new))))
+               (setf i (+ i 1)))
+             (raw-replace-lines l (+ l 1) (reverse new))
+             (setf end (cons (+ l (- n 1)) (slen (car (last-cons parts))))))))
+    (record-change (list 'i l c text))
+    (note-change l)
+    (bf! pt (adjust-ins (bf pt) p end))
+    (bf! mark (adjust-ins (bf mark) p end))
+    (let ((ims (bf im-state))) (when ims (dput ims 'start (adjust-ins (dget ims 'start) p end))))
+    (run-hook 'after-change-hook l)
+    end))
+(defun return-from-noop (p) p)
+
+(defun delete-between (p1 p2)                       ; returns the deleted text
+  (check-writable)
+  (let* ((a (clamp-pos (pos-min p1 p2))) (b (clamp-pos (pos-max p1 p2))))
+    (cond ((pos= a b) "")
+          (:else
+           (let ((text (buffer-substring a b)) (la (buf-line (car a))) (lb (buf-line (car b))))
+             (let ((joined (string-concat (substr la 0 (cdr a)) (substr-from lb (cdr b)))))
+               (if (= (car a) (car b))
+                   (buf-set-line (car a) joined)
+                   (raw-replace-lines (car a) (+ (car b) 1) (list joined))))
+             (record-change (list 'd (car a) (cdr a) text))
+             (note-change (car a))
+             (bf! pt (adjust-del (bf pt) a b))
+             (bf! mark (adjust-del (bf mark) a b))
+             (let ((ims (bf im-state))) (when ims (dput ims 'start (adjust-del (dget ims 'start) a b))))
+             (run-hook 'after-change-hook (car a))
+             text)))))
+
+;;; convenient wrappers
+(defun insert (text)                                ; insert at point, move point after
+  (let ((end (insert-at (point) text))) (bf! pt end) end))
+(defun insert-before-point (text) (insert text))
+(defun delete-region (p1 p2) (delete-between p1 p2))
+(defun replace-line (n new)                         ; keeps point sane
+  (let* ((old (buf-line n)))
+    (unless (eq old new)
+      (let ((pt (point)))
+        (delete-between (cons n 0) (cons n (slen old)))
+        (insert-at (cons n 0) new)
+        (bf! pt pt)))))
+
+(defun erase-buffer ()
+  (delete-between (buffer-start) (buffer-end))
+  (bf! pt (cons 0 0)))
+
+;;; ------------------------------------------------------------------
+;;; undo / redo
+
+(defun apply-undo-entry (e)
+  (let ((kind (car e)) (l (nth 1 e)) (c (nth 2 e)) (text (nth 3 e)))
+    (cond ((eq kind 'i)
+           (delete-between (cons l c) (end-pos-after (cons l c) text))
+           (set-point (cons l c)))
+          (:else
+           (insert-at (cons l c) text)
+           (set-point (end-pos-after (cons l c) text))))))
+
+(defun undo-group (from to)                         ; move one group FROM -> TO
+  (let ((groups (dget *cb* from)))
+    (cond ((not groups) ())
+          (:else
+           (let ((g (car groups)) (saved-target *rec-target*) (saved-in *in-undo*))
+             (dput *cb* from (cdr groups))
+             (dput *cb* to (cons () (dget *cb* to)))
+             (setf *rec-target* (if (eq to 'redo) 'redo 'undo))
+             (setf *in-undo* :t)
+             (when (eq to 'undo) (bf! undo-open ()))
+             (finally
+              (for-each e g (apply-undo-entry e))
+              (progn (setf *rec-target* saved-target) (setf *in-undo* saved-in)
+                     (bf! undo-open ())))
+             :t)))))
+(defun buffer-undo () (undo-group 'undo 'redo))
+(defun buffer-redo () (undo-group 'redo 'undo))
+
+;;; ------------------------------------------------------------------
+;;; line helpers used everywhere
+
+(defun line-indentation (n)                         ; display columns of leading ws
+  (let ((s (buf-line n)))
+    (display-col s (leading-ws-len s) (var 'tab-width))))
+(defun make-indent-string (cols)
+  (if (var 'indent-tabs-mode)
+      (let ((tw (var 'tab-width)))
+        (string-concat (str-repeat "\t" (idiv cols tw)) (spaces (mod cols tw))))
+      (spaces cols)))
+(defun set-line-indentation (n cols)                ; reindent line N, keeping point's place
+  (let* ((s (buf-line n)) (old-ws (leading-ws-len s)) (new-ws (make-indent-string (imax cols 0)))
+         (pt (point)))
+    (unless (eq (substr s 0 old-ws) new-ws)
+      (delete-between (cons n 0) (cons n old-ws))
+      (insert-at (cons n 0) new-ws)
+      (when (= (car pt) n)
+        (bf! pt (cons n (imax (slen new-ws) (+ (slen new-ws) (- (cdr pt) old-ws)))))))
+    (when (and (= (car pt) n) (< (cdr pt) (slen new-ws)))
+      (bf! pt (cons n (slen new-ws))))))
