@@ -1,4 +1,4 @@
-;;; Example ~/.limacs.limo -- user configuration for limacs.
+;; Example ~/.limacs.limo -- user configuration for limacs.
 ;;; Mode props are evaluated, so define functions BEFORE the mode that uses them.
 
 ;; --- a minor mode: highlight TODO/FIXME anywhere (overlay = (line start end face))
