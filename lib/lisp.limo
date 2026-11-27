@@ -1,0 +1,544 @@
+;; -*- limo -*-
+;; limacs/lib/lisp.limo --- the "SLIME" layer: symbol database, completion,
+;; arglist/doc lookup, eldoc, apropos, describe, macroexpand, find-definition,
+;; evaluation with output capture and a result printer.
+;;
+;; Everything is built on limo's reflection: the global environment is a dict
+;; (env-extract), docstrings live in the lambda body and in _help-dict.
+
+;;; ------------------------------------------------------------------
+;;; symbol database
+
+(setq *lisp-db* ())               ; sorted lower-case names
+(setq *lisp-dict* (make-dict))    ; name -> value
+(setq *lisp-db-n* -1)
+(setq *lisp-info-cache* (make-dict))
+
+(defun lisp-invalidate () (setf *lisp-db-n* -1) (setf *lisp-info-cache* (make-dict)))
+
+(defun lisp-refresh-db ()
+  (let* ((pairs (dict-to-list (cdr (env-extract *genv*)))) (n (list-length pairs)))
+    (unless (= n *lisp-db-n*)
+      (let ((names (list ":t" ":else")) (d (make-dict)))
+        (for-each p pairs
+          (let ((nm (str-downcase (symbol-to-string (car p)))))
+            (unless (str-prefix-p "#" nm)
+              (setf names (cons nm names))
+              (dict-set d nm (cdr p)))))
+        (setf *lisp-db* (sort string< names))
+        (setf *lisp-dict* d)
+        (setf *lisp-db-n* n)))))
+
+(defun lisp-bound-p (name) (lisp-refresh-db) (dhas *lisp-dict* name))
+(defun lisp-value (name) (lisp-refresh-db) (dget *lisp-dict* name))
+
+;;; ------------------------------------------------------------------
+;;; what is a value? (kind, arglist, doc)  -- cached per name
+
+(defun lisp-text (v) (list-to-string (write-to-list v)))
+
+(defun lisp-scan-balanced (s i)           ; S[I] = "(" -> index after the matching ")"
+  (let ((d 0) (n (slen s)) (j i) (end ()) (instr ()))
+    (while (and (< j n) (not end))
+      (let ((c (sref s j)))
+        (cond (instr (cond ((eq c "\\") (setf j (+ j 1))) ((eq c "\"") (setf instr ()))))
+              ((eq c "\"") (setf instr :t))
+              ((eq c "(") (setf d (+ d 1)))
+              ((eq c ")") (setf d (- d 1)) (when (= d 0) (setf end (+ j 1))))))
+      (setf j (+ j 1)))
+    end))
+
+(defun lisp-scan-string (s i)             ; S[I] = quote -> index after the closing quote
+  (let ((n (slen s)) (j (+ i 1)) (end ()))
+    (while (and (< j n) (not end))
+      (let ((c (sref s j)))
+        (cond ((eq c "\\") (setf j (+ j 1)))
+              ((eq c "\"") (setf end (+ j 1)))))
+      (setf j (+ j 1)))
+    end))
+
+(defun lisp-first-line (s) (car (split-lines s)))
+
+;; -> (kind args doc) ; args is a lower-case string like "(a b . c)" or nil
+(defun lisp-parse-callable (v)
+  (let* ((text (lisp-text v)) (kind (cond ((str-prefix-p "#<lambda" text) "function")
+                                          ((str-prefix-p "#<macro(#<builtin" text) "special")
+                                          ((str-prefix-p "#<macro" text) "macro")
+                                          ((str-prefix-p "#<builtin-fun" text) "builtin")
+                                          ((str-prefix-p "#<builtin" text) "special")
+                                          (:else "object")))
+         (args ()) (doc ()))
+    (when (or (eq kind "function") (eq kind "macro"))
+      (let* ((a (str-index text "(" (if (eq kind "function") 9 8)))   ; skip "#<lambda(" / "#<macro(" and "(LAMBDA"
+             (b a))
+        (when b
+          (let ((e (lisp-scan-balanced text b)))
+            (when e
+              (setf args (str-downcase (substr text b e)))
+              ;; docstring: (PROGN "doc" ...)
+              (let ((p (str-index text "(PROGN \"" e)))
+                (when (and p (< p (+ e 3)))
+                  (let* ((q (+ p 7)) (qe (lisp-scan-string text q)))
+                    (when qe
+                      (setf doc (try (read-string (substr text q qe)) ())))))))))))
+    (list kind args doc)))
+
+(defun lisp-help-text (v)
+  (try (dget _help-dict (reprn (address-of v))) ()))
+
+(defun lisp-info (name)                  ; -> (kind args doc) for a bound name
+  (let ((v (lisp-value name)) (c (dget *lisp-info-cache* name)))
+    (if (and c (eq (car c) v))
+        (cdr c)
+        (let ((info
+               (cond ((dictp v) (list "dict" () ()))
+                     ((stringp v) (list "string" () ()))
+                     ((numberp v) (list "number" () ()))
+                     ((vectorp v) (list "vector" () ()))
+                     ((consp v) (list "list" () ()))
+                     ((not v) (list "nil" () ()))
+                     ((symbolp v) (list "symbol" () ()))
+                     (:else (try (lisp-parse-callable v) (list "object" () ()))))))
+          ;; builtins: the help dict has "FUNCTION (name args)\ndoc"
+          (when (and (member (car info) '("builtin" "function" "macro" "special")))
+            (let ((h (lisp-help-text v)))
+              (when (and h (stringp h))
+                (let ((lines (split-lines h)))
+                  (when (and (not (cadr info)) (str-prefix-p "" (car lines)))
+                    (setf info (list (car info) (car lines) (caddr info))))
+                  (when (and (not (caddr info)) (cdr lines))
+                    (setf info (list (car info) (cadr info) (join-lines (cdr lines)))))))))
+          (dput *lisp-info-cache* name (cons v info))
+          info))))
+
+(defun lisp-signature (name)             ; "(foo a b . c)" / "foo" style one-liner
+  (let* ((i (lisp-info name)) (a (cadr i)))
+    (cond ((not a) name)
+          ((str-prefix-p "(" a) (if (str-prefix-p "()" a) (string-concat "(" name ")")
+                                    (string-concat "(" name " " (substr-from a 1))))
+          (:else a))))                       ; builtin help signature already has the name
+
+;;; ------------------------------------------------------------------
+;;; completion
+
+(defun lisp-seg-match (pat name)         ; "d-b" matches "dict-b..." (segments of a dashed name)
+  (let ((ps (split-by pat "-")) (ns (split-by name "-")) (ok :t) (first :t))
+    (unless (str-prefix-p (car ps) (car ns)) (setf ok ()))
+    (for-each p ps
+      (when ok
+        (let ((found ()))
+          (while (and ns (not found))
+            (when (str-prefix-p p (car ns)) (setf found :t))
+            (setf ns (cdr ns))
+            (when first (setf first ())))
+          (unless found (setf ok ())))))
+    ok))
+
+(setq *lisp-local-cache* ())              ; (buffer tick . names)
+(defun lisp-local-names ()                ; names defined in the current buffer (defun x / setq x ...)
+  (let ((c *lisp-local-cache*))
+    (if (and c (eq (car c) *cb*) (= (cadr c) (bf tick)))
+        (cddr c)
+        (let ((names ()) (n (imin (buf-nlines) 4000)) (i 0))
+          (while (< i n)
+            (let ((s (buf-line i)))
+              (when (and (> (slen s) 3) (eq (sref s 0) "(") (not (eq (sref s 1) " ")))
+                (let ((m (re-match "^\\((def[a-z-]*|setq|setf|define-[a-z-]+) +([^ ()\"]+)" s 3)))
+                  (when (and m (cdr m)) (setf names (cons (str-downcase (caddr m)) names))))))
+            (setf i (+ i 1)))
+          (setf *lisp-local-cache* (cons *cb* (cons (bf tick) names)))
+          names))))
+
+(defun lisp-candidates (pat)
+  (lisp-refresh-db)
+  (let ((pre ()) (flex ()) (seen (make-dict)))
+    (for-each n (append *lisp-db* (lisp-local-names))
+      (unless (dhas seen n)
+        (cond ((str-prefix-p pat n) (dput seen n :t) (setf pre (cons n pre)))
+              ((and (str-contains pat "-") (lisp-seg-match pat n)) (dput seen n :t) (setf flex (cons n flex))))))
+    (sort string< (if pre pre flex))))
+
+(defun lisp-common-prefix (l)
+  (let ((p (car l)))
+    (for-each s (cdr l)
+      (let ((i 0) (n (imin (slen p) (slen s))))
+        (while (and (< i n) (eq (sref p i) (sref s i))) (setf i (+ i 1)))
+        (setf p (substr p 0 i))))
+    p))
+
+(defun lisp-token-start (l c)            ; start column of the symbol/token ending at column C
+  (let ((s (buf-line l)) (i c))
+    (while (and (> i 0) (let ((ch (sref s (- i 1)))) (and (not (limo-delim-p ch)) (not (eq ch "'")) (not (eq ch "`")) (not (eq ch ",")))))
+      (setf i (- i 1)))
+    i))
+
+(defun lisp-string-start (l c)           ; inside a string: start of the file-name-ish text
+  (let ((s (buf-line l)) (i c))
+    (while (and (> i 0) (let ((ch (sref s (- i 1)))) (and (not (eq ch "\"")) (not (eq ch " ")) (not (eq ch "(")))))
+      (setf i (- i 1)))
+    i))
+
+(defun lisp-candidate-label (name)
+  (let ((i (if (lisp-bound-p name) (lisp-info name) ())))
+    (if i (string-concat name " <" (car i) ">") name)))
+
+(defun lisp-show-candidates (cands cur)
+  (let* ((w (- *cols* 6)) (out ()) (len 0) (shown 0))
+    (for-each c cands
+      (when (< (+ len (slen c) 2) w)
+        (setf out (cons (if (eq c cur) (string-concat "[" c "]") c) out))
+        (setf len (+ len (slen c) 2))
+        (setf shown (+ shown 1))))
+    (setf *message* (string-concat (string-join* "  " (reverse out))
+                                   (if (< shown (list-length cands)) (string-concat "  ...(" (num->str (list-length cands)) ")") "")))))
+
+(setq *lc* ())                            ; (buffer line start end cands idx original)
+
+(defun lisp-replace-token (l start end text)
+  (delete-between (cons l start) (cons l end))
+  (insert-at (cons l start) text)
+  (set-point (cons l (+ start (slen text)))))
+
+(defun lisp-complete-at-point ()
+  (let* ((l (point-line)) (c (point-col)) (st *lc*))
+    (cond
+      ;; repeated TAB: cycle
+      ((and st (eq *last-command* 'complete-symbol) (eq (car st) *cb*) (= (nth 1 st) l) (= (nth 3 st) c))
+       (let* ((cands (nth 4 st)) (idx (mod (+ (nth 5 st) 1) (list-length cands))) (cand (nth idx cands)) (start (nth 2 st)))
+         (lisp-replace-token l start c (if (nth 7 st) (string-concat (nth 7 st) cand) cand))
+         (setf *lc* (list *cb* l start (+ start (slen cand) (slen (or (nth 7 st) ""))) cands idx (nth 6 st) (nth 7 st)))
+         (lisp-show-candidates cands cand)
+         (setf *this-command* 'complete-symbol)))
+      (:else
+       (let* ((instr (and (> c 0) (eq (face-at l (- c 1)) 'string)))
+              (start (if instr (lisp-string-start l c) (lisp-token-start l c)))
+              (tok (substr (buf-line l) start c)))
+         (cond
+           ((and (not instr) (= start c)) ())
+           (:else
+            (let* ((cands (cond (instr (file-completions tok))
+                                (:else (lisp-candidates (str-downcase tok)))))))
+              (cond
+                ((not cands) (message "No completions for %s" tok))
+                ((not (cdr cands))
+                 (lisp-replace-token l start c (car cands))
+                 (setf *message* (if instr (car cands) (lisp-signature (car cands)))))
+                (:else
+                 (let ((cp (if instr (lisp-common-prefix cands) (lisp-common-prefix cands))))
+                   (when (> (slen cp) (slen tok)) (lisp-replace-token l start c cp))
+                   (setf *lc* (list *cb* l start (+ start (slen (if (> (slen cp) (slen tok)) cp tok))) cands -1 tok ()))
+                   (lisp-show-candidates cands ())
+                   (setf *this-command* 'complete-symbol)))))))))))
+
+(defcommand complete-symbol () "Complete the symbol (or file name, inside a string) before point."
+  (lisp-complete-at-point))
+
+;;; completer for the minibuffer (M-:) : completes the last symbol of the input
+(defun lisp-minibuffer-completions (text)
+  (let* ((i (slen text)))
+    (while (and (> i 0) (let ((ch (sref text (- i 1)))) (and (not (limo-delim-p ch)) (not (eq ch "'")) (not (eq ch "`")))))
+      (setf i (- i 1)))
+    (let ((head (substr text 0 i)) (tok (substr-from text i)))
+      (if (= (slen tok) 0) ()
+          (map1 (lambda (n) (string-concat head n)) (lisp-candidates (str-downcase tok)))))))
+
+;;; ------------------------------------------------------------------
+;;; eldoc
+
+(defun lisp-call-context ()               ; -> (name . argindex) for the call around point, or nil
+  (let ((open (scan-enclosing-open (point))))
+    (when (and open (eq (sref (buf-line (car open)) (cdr open)) "("))
+      (let* ((text (buffer-substring open (point))) (n (slen text)) (i 1) (atoms ()) (cur ()) (instr ()) (depth 0))
+        (while (< i n)
+          (let ((ch (sref text i)))
+            (cond (instr (setf cur (cons ch cur))
+                         (cond ((eq ch "\\") (setf i (+ i 1))) ((eq ch "\"") (setf instr ()))))
+                  ((eq ch "\"") (setf instr :t) (setf cur (cons ch cur)))
+                  ((or (eq ch "(") (eq ch "[")) (setf depth (+ depth 1)) (setf cur (cons ch cur)))
+                  ((or (eq ch ")") (eq ch "]")) (setf depth (- depth 1)) (setf cur (cons ch cur)))
+                  ((and (= depth 0) (or (eq ch " ") (eq ch "\n") (eq ch "\t")))
+                   (when cur (setf atoms (cons (list-to-string (reverse cur)) atoms)) (setf cur ())))
+                  (:else (setf cur (cons ch cur)))))
+          (setf i (+ i 1)))
+        (let ((partial (if cur :t ())))
+          (when cur (setf atoms (cons (list-to-string (reverse cur)) atoms)))
+          (setf atoms (reverse atoms))
+          (when atoms
+            (cons (str-downcase (car atoms))
+                  (let ((n (list-length atoms))) (if partial (- n 1) n)))))))))
+
+(defun lisp-mark-arg (sig idx)             ; "(foo a b . c)" + 2 -> "(foo a [b] . c)"
+  (let* ((inner (substr sig 1 (- (slen sig) 1))) (parts (split-by inner " ")) (out ()) (k 0))
+    (for-each p parts
+      (setf out (cons (if (and (= k idx) (not (eq p "."))) (string-concat "[" p "]") p) out))
+      (setf k (+ k 1)))
+    (string-concat "(" (string-join* " " (reverse out)) ")")))
+
+(defun lisp-eldoc-string ()
+  (let ((ctx (lisp-call-context)))
+    (when (and ctx (lisp-bound-p (car ctx)))
+      (let* ((name (car ctx)) (info (lisp-info name)) (a (cadr info)))
+        (when (and a (> (slen a) 0))
+          (let* ((sig (if (str-prefix-p "(" a) (string-concat "(" name (if (str-prefix-p "()" a) ")" (string-concat " " (substr-from a 1)))) a))
+                 (marked (if (and (> (cdr ctx) 0) (str-prefix-p "(" sig)) (lisp-mark-arg sig (cdr ctx)) sig))
+                 (doc (caddr info)))
+            (if doc (string-concat marked "  -- " (lisp-first-line doc)) marked)))))))
+
+(define-minor-mode limo-eldoc-mode "Eldoc" :global :t)
+(defun lisp-eldoc-hook ()
+  (when (and (minor-mode-enabled-p 'limo-eldoc-mode) (buffer-prop ':complete-at-point)
+             (or (not *message*) (eq *message* "")) (not (member *this-command* '(complete-symbol))))
+    (let ((s (try (lisp-eldoc-string) ())))
+      (when s (setf *message* (if (> (slen s) (- *cols* 2)) (substr s 0 (- *cols* 2)) s))))))
+(add-hook 'idle-hook lisp-eldoc-hook)
+(defun lisp-eldoc-test-hook () (when (eq *term-kind* 'test) (lisp-eldoc-hook)))
+(add-hook 'post-command-hook lisp-eldoc-test-hook)
+
+;;; ------------------------------------------------------------------
+;;; evaluation with output capture, and printing
+
+(setq *lisp-print-max* 4000)
+(setq *1 ()) (setq *2 ()) (setq *3 ()) (setq *e ())
+
+(defun lisp-print (v)                      ; compact, bounded printed form
+  (cond ((dictp v) (string-concat "#<dict " (num->str (list-length (dict-to-list v))) " entries>"))
+        ((stringp v) (repr v))
+        ((not v) "nil")
+        ((or (numberp v) (symbolp v)) (repr v))
+        (:else
+         (let ((text (try (lisp-text v) "#<unprintable>")))
+           (cond ((or (str-prefix-p "#<lambda" text) (str-prefix-p "#<macro" text))
+                  (let* ((i (parse-callable-cached v)) (a (cadr i)))
+                    (string-concat "#<" (car i) (if a (string-concat " " a) "") ">")))
+                 ((> (slen text) *lisp-print-max*) (string-concat (substr text 0 *lisp-print-max*) " ..."))
+                 (:else text))))))
+(defun parse-callable-cached (v) (try (lisp-parse-callable v) (list "object" () ())))
+
+(defun proper-list-p (v)
+  (let ((ok :t) (x v) (n 0))
+    (while (and ok x (< n 100000))
+      (if (consp x) (progn (setf x (cdr x)) (setf n (+ n 1))) (setf ok ())))
+    ok))
+
+(defun lisp-pp (v)                         ; multi-line when too long for one line
+  (let ((s (lisp-print v)))
+    (if (and (> (slen s) 72) (consp v) (proper-list-p v) (cdr v) (not (dictp v)))
+        (let ((parts ()) (k 0) (x v))
+          (while (and x (< k 200))
+            (setf parts (cons (lisp-print (car x)) parts)) (setf x (cdr x)) (setf k (+ k 1)))
+          (when x (setf parts (cons "..." parts)))
+          (string-concat "(" (string-join* "\n " (reverse parts)) ")"))
+        s)))
+
+;; -> (ok? value output-string) ; ok? is :t or the exception
+(defun lisp-eval-form (form)
+  (let ((saved print) (buf ()) (res ()))
+    (setf print (lambda x
+                  (cond ((not (cdr x)) (setf buf (cons (car x) buf)))
+                        ((or (eq (car x) stdout) (eq (car x) stderr)) (setf buf (cons (cadr x) buf)))
+                        (:else (apply saved x)))))
+    (finally
+     (setf res (try (list :t (eval form *genv*)) (list () _exception)))
+     (setf print saved))
+    (lisp-invalidate)
+    (list (car res) (cadr res) (list-to-string (reverse buf)))))
+
+(defun lisp-record-result (v)
+  (setf *3 *2) (setf *2 *1) (setf *1 v))
+
+(defun lisp-format-error (e) (describe-error e))
+
+;;; ------------------------------------------------------------------
+;;; apropos / describe / macroexpand / inspect
+
+(defun lisp-apropos-list (pat)
+  (lisp-refresh-db)
+  (let ((p (str-downcase pat)) (res ()))
+    (for-each n *lisp-db* (when (and (str-contains n p) (not (str-prefix-p ":" n))) (setf res (cons n res))))
+    (reverse res)))
+
+(defun lisp-describe-text (name)
+  (cond ((not (lisp-bound-p name)) (string-concat name " is not bound"))
+        (:else
+         (let* ((i (lisp-info name)) (v (lisp-value name)))
+           (string-join* "\n"
+             (filter (lambda (x) (> (slen x) 0))
+               (list (string-concat name " is a " (car i))
+                     (if (cadr i) (lisp-signature name) "")
+                     (if (caddr i) (caddr i) "")
+                     (if (member (car i) '("function" "macro" "builtin" "special")) "" (string-concat "Value: " (lisp-pp v))))))))))
+
+(defun lisp-symbol-at-point ()
+  (let* ((l (point-line)) (s (buf-line l)) (c (point-col)) (n (slen s)) (a c) (b c))
+    (while (and (> a 0) (not (limo-delim-p (sref s (- a 1)))) (not (member (sref s (- a 1)) '("'" "`" ",")))) (setf a (- a 1)))
+    (while (and (< b n) (not (limo-delim-p (sref s b)))) (setf b (+ b 1)))
+    (if (< a b) (str-downcase (substr s a b)) ())))
+
+(defun lisp-ask-symbol (prompt)
+  (let* ((def (lisp-symbol-at-point))
+         (r (read-minibuffer (if def (string-concat prompt " (" def "): ") (string-concat prompt ": ")) "" lisp-minibuffer-completions 'symbol)))
+    (str-downcase (if (= (slen r) 0) (or def "") r))))
+
+(defcommand limo-describe-symbol () "Show type, arglist and documentation of a limo symbol."
+  (let ((n (lisp-ask-symbol "Describe")))
+    (when (= (slen n) 0) (user-error "No symbol"))
+    (show-help-buffer "*Help*" (lisp-describe-text n))))
+
+(defcommand limo-apropos () "List limo symbols whose name contains a string."
+  (let* ((pat (read-minibuffer "Apropos: " "" ()))
+         (names (lisp-apropos-list pat)))
+    (show-help-buffer "*Apropos*"
+      (string-concat (num->str (list-length names)) " symbols matching \"" pat "\"\n\n"
+        (join-lines (map1 (lambda (n)
+                            (let* ((i (lisp-info n)) (d (caddr i)))
+                              (string-concat n (spaces (imax 1 (- 32 (slen n)))) (car i)
+                                             (if d (string-concat "  " (lisp-first-line d)) ""))))
+                          (if (> (list-length names) 400) (take-n names 400) names)))))))
+(defun take-n (l n) (let ((r ()) (k 0)) (while (and l (< k n)) (setf r (cons (car l) r)) (setf l (cdr l)) (setf k (+ k 1))) (reverse r)))
+
+(defun lisp-form-before-point ()
+  (let* ((e (point)) (s (pos-backward-sexp e))) (buffer-substring s e)))
+
+(defun lisp-macroexpand-text (text)
+  (let* ((form (cadr (read-string (string-concat "(progn " text "\n)")))) (out ()) (cur form) (k 0))
+    (setf out (macroexpand-1 form))
+    (lisp-pp out)))
+
+(defcommand limo-macroexpand () "Expand (once) the macro call before point."
+  (let ((text (lisp-form-before-point)))
+    (show-help-buffer "*Macroexpansion*" (lisp-macroexpand-text text))))
+
+(defun lisp-inspect-text (v)
+  (cond ((dictp v)
+         (let ((items (dict-to-list v)))
+           (string-concat "dict, " (num->str (list-length items)) " entries\n\n"
+             (join-lines (map1 (lambda (p) (string-concat (lisp-print (car p)) " : " (lisp-print (cdr p))))
+                               (take-n items 300))))))
+        ((and (consp v) (proper-list-p v) (not (str-prefix-p "#<" (lisp-text v))))
+         (let ((k -1))
+           (string-concat "list, " (num->str (list-length v)) " elements\n\n"
+             (join-lines (map1 (lambda (x) (progn (setf k (+ k 1)) (string-concat (num->str k) ": " (lisp-print x)))) (take-n v 300))))))
+        ((vectorp v) (string-concat "vector\n\n" (lisp-print v)))
+        ((stringp v) (string-concat "string, " (num->str (slen v)) " bytes\n\n" v))
+        (:else
+         (let ((text (try (lisp-text v) "")))
+           (if (or (str-prefix-p "#<lambda" text) (str-prefix-p "#<macro" text))
+               (let ((i (parse-callable-cached v)))
+                 (string-concat (car i) " " (or (cadr i) "") "\n\n" (if (caddr i) (caddr i) "") "\n\nSource:\n" (lisp-limited text)))
+               (string-concat (lisp-print v) ""))))))
+(defun lisp-limited (s) (if (> (slen s) 3000) (string-concat (substr s 0 3000) " ...") s))
+
+(defcommand limo-inspect () "Evaluate an expression and inspect the result."
+  (let* ((s (read-minibuffer "Inspect: " "" lisp-minibuffer-completions 'eval))
+         (r (lisp-eval-form (car (read-all-forms s)))))
+    (if (car r)
+        (show-help-buffer "*Inspector*" (lisp-inspect-text (cadr r)))
+        (user-error "%s" (lisp-format-error (cadr r))))))
+
+;;; ------------------------------------------------------------------
+;;; find definition (M-.) / back (M-,)
+
+(setq *xref-stack* ())
+
+(defun lisp-source-dirs ()
+  (let ((dirs (list *limacs-dir*)) (f (bf file)))
+    (when f (let ((i (str-rindex f "/" (slen f)))) (when i (setf dirs (cons (substr f 0 i) dirs)))))
+    (when (var-bound-p '*user-src*) (setf dirs (append *user-src* dirs)))
+    dirs))
+(defun var-bound-p (s) (try (progn (eval s *genv*) :t) ()))
+
+(defun lisp-grep-def (name)                ; -> list of (file line text)
+  (let* ((rx (string-concat "^[ ]*\\((defun|defmacro|defcommand|define-[a-z-]+|setq|defvar|defparameter|define-major-mode|define-minor-mode) +'?"
+                            (shell-regex-quote name) "([ )]|$)"))
+         (res ()))
+    (for-each d (lisp-source-dirs)
+      (let ((r (try (run-process "grep" "-rnEi" "--include=*.limo" "-m" "5" "-e" rx d) ())))
+        (when (and r (eq (car r) 0))
+          (for-each ln (split-lines (cadr r))
+            (let ((m (re-match "^(.*):([0-9]+):(.*)$" ln 4)))
+              (when (and m (cdr m)) (setf res (cons (list (cadr m) (str->num (caddr m)) (cadddr m)) res))))))))
+    (reverse res)))
+(defun shell-regex-quote (s)
+  (let ((out ()) (i 0) (n (slen s)))
+    (while (< i n)
+      (let ((c (sref s i))) (setf out (cons (if (str-contains "\\.*+?()[]{}|^$" c) (string-concat "\\" c) c) out)))
+      (setf i (+ i 1)))
+    (list-to-string (reverse out))))
+
+(defcommand limo-find-definition () "Jump to the definition of the symbol at point."
+  (let* ((name (lisp-ask-symbol "Find definition of")) (defs (lisp-grep-def name)))
+    (cond ((not defs) (user-error "No definition found for %s" name))
+          (:else
+           (let ((d (if (cdr defs)
+                        (let* ((labels (map1 (lambda (x) (string-concat (file-basename (car x)) ":" (num->str (cadr x)) ": " (str-trim (caddr x)))) defs))
+                               (pick (read-minibuffer "Definition: " (car labels) labels 'xref)))
+                          (let ((r ()) (k 0))
+                            (for-each lb labels (when (eq lb pick) (setf r (nth k defs))) (setf k (+ k 1)))
+                            (or r (car defs))))
+                        (car defs))))
+             (setf *xref-stack* (cons (cons *cb* (bf pt)) *xref-stack*))
+             (visit-file (car d))
+             (set-point (cons (- (cadr d) 1) 0))
+             (bf! top (imax 0 (- (cadr d) 6))))))))
+
+(defcommand limo-pop-mark () "Go back to where M-. was invoked."
+  (unless *xref-stack* (user-error "Definition stack is empty"))
+  (let ((p (car *xref-stack*)))
+    (setf *xref-stack* (cdr *xref-stack*))
+    (when (member (car p) *buffers*) (set-buffer (car p)) (set-point (cdr p)))))
+
+;;; ------------------------------------------------------------------
+;;; evaluation commands for source buffers
+
+(defun lisp-defun-bounds ()                ; top-level form around point -> (start . end) or nil
+  (let ((l (point-line)))
+    (while (and (> l 0) (not (eq (sref (string-concat (buf-line l) " ") 0) "("))) (setf l (- l 1)))
+    (let ((s (cons l 0)))
+      (if (eq (sref (string-concat (buf-line l) " ") 0) "(")
+          (cons s (pos-forward-sexp s))
+          ()))))
+
+(defun lisp-eval-and-report (text what)
+  (let* ((forms (try (read-all-forms text) (user-error "Read error: %s" (describe-error _exception)))) (r ()))
+    (for-each f forms
+      (when (or (not r) (car r)) (setf r (lisp-eval-form f))))
+    (cond ((not r) (message "Nothing to evaluate"))
+          ((car r) (lisp-record-result (cadr r))
+                   (setf *message* (string-concat (if (> (slen (caddr r)) 0) (string-concat (str-trim (lisp-first-line (caddr r))) "  ") "")
+                                                  "=> " (lisp-first-line (lisp-print (cadr r))))))
+          (:else (setf *e (cadr r)) (setf *message* (string-concat "!! " (lisp-format-error (cadr r))))))
+    r))
+
+(defcommand eval-defun () "Evaluate the top-level form around point."
+  (let ((b (lisp-defun-bounds)))
+    (unless b (user-error "No top-level form here"))
+    (lisp-eval-and-report (buffer-substring (car b) (cdr b)) "defun")))
+
+(defcommand eval-region-limo () "Evaluate the region as limo code."
+  (require-region)
+  (let ((rb (region-bounds)))
+    (lisp-eval-and-report (buffer-substring (car rb) (cdr rb)) "region")
+    (deactivate-mark)))
+
+(defcommand eval-last-sexp () "Evaluate the expression before point as limo code; show the result in the echo area."
+  (lisp-eval-and-report (lisp-form-before-point) "sexp"))
+
+(defcommand eval-buffer-limo () "Evaluate the whole buffer as limo code."
+  (let ((r (lisp-eval-and-report (buffer-string) "buffer")))
+    (when (and r (car r)) (message "Evaluated %s" (bf name)))))
+
+(defun lisp-bind-source-keys (map)
+  (define-key map "C-M-i" 'complete-symbol)
+  (define-key map "M-TAB" 'complete-symbol)
+  (define-key map "M-." 'limo-find-definition)
+  (define-key map "M-," 'limo-pop-mark)
+  (define-key map "C-M-x" 'eval-defun)
+  (define-key map "C-c C-c" 'eval-defun)
+  (define-key map "C-c C-r" 'eval-region-limo)
+  (define-key map "C-c C-e" 'eval-last-sexp)
+  (define-key map "C-c C-b" 'eval-buffer-limo)
+  (define-key map "C-c C-k" 'eval-buffer-limo)
+  (define-key map "C-c C-d" 'limo-describe-symbol)
+  (define-key map "C-c C-a" 'limo-apropos)
+  (define-key map "C-c C-m" 'limo-macroexpand)
+  (define-key map "C-c C-i" 'limo-inspect))

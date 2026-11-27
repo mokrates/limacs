@@ -1,0 +1,309 @@
+;; -*- limo -*-
+;; limacs/modes/limo-repl.limo --- an interactive limo console (think SLIME's REPL).
+;;
+;;   M-x limo-repl  (C-c C-z in a limo buffer)     open / switch to *limo*
+;;
+;; The buffer is an ordinary limacs buffer: everything you type after the last
+;; "limo> " prompt is the input; everything above is read-only history.
+;; Output lines are marked:   "=> " result   ".. " result (continued)
+;;                            "| " printed output   "!! " error   ";; " notes
+;; The REPL evaluates *inside* the editor process, so you can redefine limacs
+;; itself from here -- and an endless loop freezes the editor (no interrupt).
+
+(setq *repl-prompt* "limo> ")
+(setq *repl-plen* 6)
+(setq *repl-history* ())            ; newest first
+(setq *repl-hidx* -1)
+(setq *repl-saved* "")
+(setq *repl-history-file* ())
+(setq *repl-previous* ())           ; buffer we came from (for C-c C-z toggling)
+
+;;; ------------------------------------------------------------------
+;;; line classification and syntax
+
+(defun repl-output-line-p (s)
+  (or (str-prefix-p "=> " s) (str-prefix-p ".. " s) (str-prefix-p "| " s)
+      (str-prefix-p "!! " s) (str-prefix-p ";; " s) (eq s "|") (eq s "=>")))
+(defun repl-prompt-line-p (s) (str-prefix-p *repl-prompt* s))
+
+(defun repl-scan-line (line state)
+  (cond ((repl-prompt-line-p line)
+         (let ((r (limo-scan-line (string-concat "      " (substr-from line *repl-plen*)) (cons () ()))))
+           (cons (cons (list 0 (- *repl-plen* 1) 'prompt) (car r)) (cdr r))))
+        ((repl-output-line-p line)
+         (cons (list (list 0 (slen line) (cond ((str-prefix-p "!!" line) 'error)
+                                               ((or (str-prefix-p "=>" line) (str-prefix-p ".." line)) 'string)
+                                               (:else 'comment))))
+               (cons () ())))
+        (:else (limo-scan-line line state))))
+
+(defun repl-skip-regex (state) "")          ; never skip: output lines reset the state
+
+;;; ------------------------------------------------------------------
+;;; the buffer
+
+(defun repl-last-prompt-line ()
+  (let ((l (- (buf-nlines) 1)))
+    (while (and (> l 0) (not (repl-prompt-line-p (buf-line l)))) (setf l (- l 1)))
+    l))
+
+(defun repl-input-start () (cons (repl-last-prompt-line) *repl-plen*))
+
+(defun repl-set-ro ()
+  (bf! ro-end (repl-input-start))
+  (bf! undo ()) (bf! redo ()) (bf! modified ()))
+
+(defun repl-append (text)                   ; add text at the very end (always allowed)
+  (set-point (buffer-end))
+  (insert text))
+
+(defun repl-prompt ()
+  (when (> (slen (buf-line (- (buf-nlines) 1))) 0) (repl-append "\n"))
+  (repl-append *repl-prompt*)
+  (repl-set-ro)
+  (set-point (buffer-end)))
+
+(defun repl-indent-line ()
+  (let ((l (point-line)))
+    (cond ((or (repl-prompt-line-p (buf-line l)) (repl-output-line-p (buf-line l))) ())
+          (:else (limo-indent-line)))))
+
+(define-major-mode limo-repl-mode limo-mode "Limo REPL"
+  :scan-line repl-scan-line
+  :skip-regex repl-skip-regex
+  :indent-line repl-indent-line
+  :init-state (cons () ()))
+
+;;; ------------------------------------------------------------------
+;;; history (persistent)
+
+(defun repl-escape (s)
+  (let ((out ()) (i 0) (n (slen s)))
+    (while (< i n)
+      (let ((c (sref s i)))
+        (setf out (cons (cond ((eq c "\\") "\\\\") ((eq c "\n") "\\n") (:else c)) out)))
+      (setf i (+ i 1)))
+    (list-to-string (reverse out))))
+(defun repl-unescape (s)
+  (let ((out ()) (i 0) (n (slen s)))
+    (while (< i n)
+      (let ((c (sref s i)))
+        (cond ((and (eq c "\\") (< (+ i 1) n))
+               (setf out (cons (if (eq (sref s (+ i 1)) "n") "\n" (sref s (+ i 1))) out))
+               (setf i (+ i 2)))
+              (:else (setf out (cons c out)) (setf i (+ i 1))))))
+    (list-to-string (reverse out))))
+
+(defun repl-history-path ()
+  (or *repl-history-file*
+      (string-concat (or (env-var "HOME") ".") "/.limacs-repl-history")))
+
+(defun repl-load-history ()
+  (let ((p (repl-history-path)))
+    (when (file-exists-p p)
+      (try (let ((lines (split-lines (read-file-contents p))) (h ()))
+             (for-each ln lines (when (> (slen ln) 0) (setf h (cons (repl-unescape ln) h))))
+             (setf *repl-history* (take-n h 200)))
+           ()))))
+
+(defun repl-save-history ()
+  (try (let ((f (file-open (repl-history-path) "w")))
+         (file-write f (string-concat (join-lines (map1 repl-escape (reverse (take-n *repl-history* 200)))) "\n"))
+         (file-close f))
+       ()))
+
+(defun repl-remember (text)
+  (unless (or (= (slen (str-trim text)) 0) (and *repl-history* (eq (car *repl-history*) text)))
+    (setf *repl-history* (cons text *repl-history*))
+    (repl-save-history)))
+
+;;; ------------------------------------------------------------------
+;;; evaluation
+
+(defun repl-input-text () (buffer-substring (repl-input-start) (buffer-end)))
+
+(defun repl-prefix-lines (prefix prefix2 text)           ; "a\nb" -> "=> a\n.. b"
+  (let ((ls (split-lines text)) (first :t) (out ()))
+    (for-each l ls
+      (setf out (cons (string-concat (if first prefix prefix2) l) out))
+      (setf first ()))
+    (join-lines (reverse out))))
+
+(defun repl-emit (text)                                   ; one block of output lines
+  (repl-append (string-concat "\n" text)))
+
+(defun repl-eval-text (text)
+  (let ((forms (try (read-all-forms text) (progn (repl-emit (string-concat "!! read error: " (describe-error _exception))) 'bad))))
+    (unless (eq forms 'bad)
+      (let ((stop ()))
+        (for-each f forms
+          (unless stop
+            (let ((r (lisp-eval-form f)))
+              (when (> (slen (caddr r)) 0)
+                (let ((o (caddr r)))
+                  (repl-emit (repl-prefix-lines "| " "| " (if (eq (sref o (- (slen o) 1)) "\n") (substr o 0 (- (slen o) 1)) o)))))
+              (cond ((car r) (lisp-record-result (cadr r))
+                             (repl-emit (repl-prefix-lines "=> " ".. " (lisp-pp (cadr r)))))
+                    (:else (setf *e (cadr r)) (setf stop :t)
+                           (repl-emit (repl-prefix-lines "!! " "!! " (lisp-format-error (cadr r)))))))))))))
+
+;;; comma commands -------------------------------------------------------
+
+(setq *repl-commands* ())     ; (name help fn)
+(defun repl-define-command (name help fn) (setf *repl-commands* (append *repl-commands* (list (list name help fn)))))
+
+(defun repl-command-split (text)             ; ",doc car" -> ("doc" . "car")
+  (let* ((s (str-trim (substr-from text 1))) (i (str-index s " " 0)))
+    (if i (cons (substr s 0 i) (str-trim (substr-from s i))) (cons s ""))))
+
+(defun repl-run-comma (text)
+  (let* ((cs (repl-command-split text)) (name (car cs)) (arg (cdr cs))
+         (cmd (repl-find-command name)))
+    (cond ((not cmd) (repl-emit (string-concat "!! unknown command ," name "  (,help lists them)")))
+          (:else (try ((caddr cmd) arg)
+                      (repl-emit (string-concat "!! " (describe-error _exception))))))))
+
+(defun repl-find-command (name)
+  (let ((r ())) (for-each c *repl-commands* (when (eq (car c) name) (setf r c))) r))
+(defun repl-note (text) (repl-emit (repl-prefix-lines ";; " ";; " text)))
+
+(repl-define-command "help" "list the comma commands"
+  (lambda (arg) (repl-note (join-lines (map1 (lambda (c) (string-concat "," (car c) (spaces (imax 1 (- 10 (slen (car c))))) (cadr c))) *repl-commands*)))))
+(repl-define-command "clear" "clear the buffer (also C-c C-l)"
+  (lambda (arg) (repl-clear-buffer)))
+(repl-define-command "doc" "show the documentation of a symbol"
+  (lambda (arg) (repl-note (lisp-describe-text (str-downcase arg)))))
+(repl-define-command "apropos" "symbols whose name contains a string"
+  (lambda (arg) (let ((l (lisp-apropos-list arg)))
+                  (repl-note (if l (string-join* "  " (take-n l 120)) "no matches")))))
+(repl-define-command "expand" "macroexpand-1 a form"
+  (lambda (arg) (repl-note (lisp-macroexpand-text arg))))
+(repl-define-command "inspect" "inspect the value of an expression"
+  (lambda (arg) (let ((r (lisp-eval-form (car (read-all-forms arg)))))
+                  (if (car r) (repl-note (lisp-inspect-text (cadr r))) (repl-emit (string-concat "!! " (lisp-format-error (cadr r))))))))
+(repl-define-command "load" "load a limo file"
+  (lambda (arg) (let ((r (lisp-eval-form (list 'load (expand-file-name arg)))))
+                  (if (car r) (repl-note (string-concat "loaded " arg)) (repl-emit (string-concat "!! " (lisp-format-error (cadr r))))))))
+(repl-define-command "where" "where is a symbol defined?"
+  (lambda (arg) (let ((defs (lisp-grep-def (str-downcase arg))))
+                  (repl-note (if defs (join-lines (map1 (lambda (d) (string-concat (car d) ":" (num->str (cadr d)))) defs)) "not found")))))
+(repl-define-command "history" "show the last 20 inputs"
+  (lambda (arg) (repl-note (join-lines (map1 (lambda (h) (car (split-lines h))) (take-n *repl-history* 20))))))
+(repl-define-command "last" "print *1 *2 *3 and *e"
+  (lambda (arg) (repl-note (string-concat "*1 = " (lisp-print *1) "\n*2 = " (lisp-print *2) "\n*3 = " (lisp-print *3) "\n*e = " (lisp-print *e)))))
+
+(defun repl-clear-buffer ()
+  (let ((pending (repl-input-text)))
+    (bf! ro-end ()) (bf! readonly ())
+    (erase-buffer)
+    (insert (string-concat ";; limo REPL cleared" "\n" *repl-prompt* pending))
+    (repl-set-ro)
+    (bf! top 0)
+    (set-point (buffer-end))))
+
+;;; commands -------------------------------------------------------------
+
+(defun repl-incomplete-p ()
+  (let ((st (state-at (buffer-end)))) (if (or (car st) (cdr st)) :t ())))
+
+(defun repl-line-text-for-copy (s)
+  (cond ((repl-prompt-line-p s) (substr-from s *repl-plen*))
+        ((str-prefix-p "=> " s) (substr-from s 3))
+        ((str-prefix-p ".. " s) (substr-from s 3))
+        (:else s)))
+
+(defcommand repl-return () "Evaluate the input if it is complete, otherwise start a new line."
+  (cond
+    ((pos< (point) (repl-input-start))                      ; on old text: copy it down
+     (let ((text (str-trim-right (repl-line-text-for-copy (current-line-text)))))
+       (set-point (buffer-end))
+       (insert text)))
+    ((= (slen (str-trim (repl-input-text))) 0) (repl-append "\n") (repl-prompt))
+    ((repl-incomplete-p) (set-point (buffer-end)) (newline-and-indent))
+    ;; text after point (e.g. auto-inserted closing parens): RET splits the line instead
+    ((> (slen (str-trim (substr-from (current-line-text) (point-col)))) 0)
+     (if (= (point-line) (- (buf-nlines) 1)) (newline-and-indent) (set-point (buffer-end))))
+    (:else
+     (let ((text (repl-input-text)))
+       (set-point (buffer-end))
+       (setf *repl-hidx* -1)
+       (repl-remember text)
+       (if (and (str-prefix-p "," (str-trim text)) (> (slen (str-trim text)) 1) (not (eq (sref (str-trim text) 1) " ")))
+           (repl-run-comma (str-trim text))
+           (repl-eval-text text))
+       (repl-append "\n")
+       (repl-prompt)))))
+
+(defcommand repl-newline () "Insert a newline in the input without evaluating."
+  (set-point (buffer-end)) (newline-and-indent))
+
+(defun repl-replace-input (text)
+  (let ((s (repl-input-start)))
+    (delete-between s (buffer-end))
+    (set-point s)
+    (insert text)))
+
+(defcommand repl-history-prev () "Previous input from the history."
+  (when (< (+ *repl-hidx* 1) (list-length *repl-history*))
+    (when (= *repl-hidx* -1) (setf *repl-saved* (repl-input-text)))
+    (setf *repl-hidx* (+ *repl-hidx* 1))
+    (repl-replace-input (nth *repl-hidx* *repl-history*))))
+(defcommand repl-history-next () "Next input from the history."
+  (when (> *repl-hidx* -1)
+    (setf *repl-hidx* (- *repl-hidx* 1))
+    (repl-replace-input (if (= *repl-hidx* -1) *repl-saved* (nth *repl-hidx* *repl-history*)))))
+
+(defcommand repl-beginning-of-line () "Go to the start of the input (after the prompt) or of the line."
+  (let ((s (repl-input-start)))
+    (if (and (= (point-line) (car s)) (> (point-col) (cdr s)))
+        (set-point s)
+        (set-point (cons (point-line) 0)))))
+
+(defcommand repl-kill-input () "Discard the current input."
+  (repl-replace-input "") (setf *repl-hidx* -1))
+
+(defcommand repl-clear () "Clear the REPL buffer (keeping the current input)."
+  (repl-clear-buffer))
+
+(define-key limo-repl-mode-map "RET" 'repl-return)
+(define-key limo-repl-mode-map "M-RET" 'repl-newline)
+(define-key limo-repl-mode-map "C-j" 'repl-newline)
+(define-key limo-repl-mode-map "M-p" 'repl-history-prev)
+(define-key limo-repl-mode-map "M-n" 'repl-history-next)
+(define-key limo-repl-mode-map "C-a" 'repl-beginning-of-line)
+(define-key limo-repl-mode-map "C-c C-u" 'repl-kill-input)
+(define-key limo-repl-mode-map "C-c C-l" 'repl-clear)
+(define-key limo-repl-mode-map "C-c C-c" 'repl-kill-input)
+
+;;; entry point ----------------------------------------------------------
+
+(defcommand limo-repl () "Open (or switch to) the limo console, *limo*."
+  (let ((existing (get-buffer "*limo*")) (from *cb*))
+    (cond (existing
+           (unless (eq from existing) (setf *repl-previous* from))
+           (set-buffer existing)
+           (if (eq from existing)
+               (when (and *repl-previous* (memq-buffer *repl-previous*)) (set-buffer *repl-previous*))
+               (set-point (buffer-end))))
+          (:else
+           (setf *repl-previous* from)
+           (let ((b (create-buffer "*limo*")))
+             (set-buffer b)
+             (set-major-mode 'limo-repl-mode)
+             (when (not *repl-history*) (repl-load-history))
+             (insert (string-concat ";; limo REPL -- RET evaluates, TAB completes, M-p/M-n history, ,help for commands\n"))
+             (repl-prompt))))))
+
+(defcommand limo-send-to-repl () "Evaluate the region (or the top-level form at point) in the REPL, showing it there."
+  (let* ((text (cond ((region-active-p) (let* ((rb (region-bounds)) (tx (buffer-substring (car rb) (cdr rb)))) (deactivate-mark) tx))
+                     (:else (let ((b (lisp-defun-bounds))) (if b (buffer-substring (car b) (cdr b)) (user-error "Nothing to send"))))))
+         (from *cb*))
+    (limo-repl)
+    (repl-replace-input (str-trim text))
+    (repl-return)
+    (set-buffer from)
+    (message "Sent to *limo*")))
+
+(define-key limo-mode-map "C-c C-z" 'limo-repl)
+(define-key limo-mode-map "C-c C-s" 'limo-send-to-repl)
+(define-key *global-map* "C-c C-z" 'limo-repl)
