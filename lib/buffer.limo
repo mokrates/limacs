@@ -224,12 +224,17 @@
 
 (defun check-writable ()
   (when (bf readonly) (throw (list 'buffer-read-only (bf name)))))
+;; A buffer may protect a prefix: everything before (bf ro-end) is read-only (used by the REPL).
+(defun check-writable-at (p)
+  (check-writable)
+  (let ((ro (bf ro-end)))
+    (when (and ro (pos< p ro)) (throw (list 'buffer-read-only (bf name))))))
 
 ;;; ------------------------------------------------------------------
 ;;; the two primitives every edit goes through
 
 (defun insert-at (p text)
-  (check-writable)
+  (check-writable-at p)
   (when (= (slen text) 0) (return-from-noop p))
   (let* ((parts (split-lines text)) (l (car p)) (c (cdr p)) (line (buf-line l))
          (pre (substr line 0 c)) (post (substr-from line c)) (end ()))
@@ -255,7 +260,7 @@
 (defun return-from-noop (p) p)
 
 (defun delete-between (p1 p2)                       ; returns the deleted text
-  (check-writable)
+  (check-writable-at (pos-min p1 p2))
   (let* ((a (clamp-pos (pos-min p1 p2))) (b (clamp-pos (pos-max p1 p2))))
     (cond ((pos= a b) "")
           (:else

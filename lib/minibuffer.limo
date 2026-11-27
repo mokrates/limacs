@@ -119,5 +119,5 @@
   (cond ((stringp v) (repr v)) ((not v) "nil") ((or (numberp v) (symbolp v) (consp v)) (repr v)) (:else "#<object>")))
 
 (defcommand eval-expression () "Evaluate a limo expression and show the result."
-  (let ((s (read-minibuffer "Eval: " "" () 'eval)))
+  (let ((s (read-minibuffer "Eval: " "" lisp-minibuffer-completions 'eval)))
     (message "%s" (print-value (eval-string s)))))

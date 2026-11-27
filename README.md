@@ -22,6 +22,28 @@ F3 / `C-x (` start recording (F3 while recording inserts the counter) · F4 / `C
 `(define-kmacro 'name "C-a h i RET")` for your init file. A macro replays recorded keys through the normal key lookup,
 so it works with M-x, search, minibuffer prompts and every mode. Any error aborts a running macro. "Def" shows in the mode line while recording.
 
+## The limo REPL (SLIME-style)
+
+`M-x limo-repl` or `C-c C-z` (in a limo buffer; again to jump back) opens `*limo*`.
+
+- **RET** evaluates the input when its parentheses balance, otherwise it starts an indented continuation line
+  (so with electric-pair, `(defun f (x)` + RET just opens the next line). **M-RET** / **C-j** always insert a newline.
+  RET on an old line copies it down to the prompt. History is on **M-p / M-n** and persists in `~/.limacs-repl-history`.
+- Results are shown as `=> value`, printed output as `| text`, errors as `!! message`. `*1 *2 *3` hold the last results, `*e` the last error.
+- **TAB completes** everywhere in limo buffers (when the line is already indented): symbols from the live environment
+  (so it also knows limacs' own functions and everything you just defined), prefix first, then dash-segment matching
+  (`d-s` → `dict-set`), names defined in the current buffer, and file names inside strings. TAB again cycles the candidates.
+  `M-:` completes too.
+- **Eldoc**: while you type a call, the echo area shows its arglist with the current argument marked, e.g. `(str-prefix-p p [s])`, plus the first doc line.
+- Comma commands in the REPL: `,help ,doc sym ,apropos str ,expand form ,inspect expr ,load file ,where sym ,history ,last ,clear`.
+- In any limo buffer: `C-c C-c` / `C-M-x` eval defun, `C-c C-e` eval before point, `C-c C-r` region, `C-c C-k` buffer,
+  `C-c C-s` send form/region to the REPL, `M-.` find definition (greps the limacs sources and the current file's directory) and `M-,` back,
+  `C-c C-d` describe symbol, `C-c C-a` apropos, `C-c C-m` macroexpand, `C-c C-i` inspect.
+- Docstrings: `(defun f (x) "Doc here." ...)` is picked up by describe, apropos and eldoc.
+
+The REPL evaluates inside the editor process (that is what makes it powerful: redefine limacs while it runs),
+so an endless loop freezes the editor and there is no interrupt.
+
 ## Themes
 `M-x load-theme` (dark, light, or your own). Define one with `(define-theme 'name '((keyword . "1;38;5;19") (comment . "3;38;5;243") ...))`
 (face → SGR parameters; see `lib/display.limo` for all face names), then `(load-theme 'name)` in your init file.

@@ -43,7 +43,9 @@
         ((buffer-prop ':indent-line)
          (let* ((l (point-line)) (old (buf-line l)) (oldcol (point-col)) (ws (leading-ws-len old)))
            (indent-current-line)
-           (when (<= oldcol ws) (set-point (cons l (leading-ws-len (buf-line l)))))))
+           (when (<= oldcol ws) (set-point (cons l (leading-ws-len (buf-line l)))))
+           (let ((cf (buffer-prop ':complete-at-point)))
+             (when (and cf (> oldcol ws) (eq old (buf-line l))) (cf)))))
         (:else
          (let* ((tw (imin 8 (var 'tab-width))) (col (display-col (current-line-text) (point-col) tw)))
            (if (var 'indent-tabs-mode) (insert "\t") (insert (spaces (- tw (mod col tw)))))))))

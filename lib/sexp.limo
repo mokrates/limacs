@@ -134,6 +134,4 @@
 (defcommand indent-sexp () "Reindent the expression following point."
   (let* ((a (car (skip-ws-forward (point)))) (e (pos-forward-sexp (point))))
     (indent-lines a (car e))))
-(defcommand eval-last-sexp () "Evaluate the expression before point as limo code."
-  (let* ((e (point)) (s (pos-backward-sexp e)) (text (buffer-substring s e)))
-    (message "%s" (print-value (eval-string text)))))
+

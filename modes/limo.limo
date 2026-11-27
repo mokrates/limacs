@@ -188,13 +188,11 @@
   :skip-regex limo-skip-regex
   :init-state (cons () ())
   :indent-line limo-indent-line
+  :complete-at-point lisp-complete-at-point
   :comment-start ";; "
   :pairs '(("(" . ")") ("[" . "]") ("\"" . "\""))
   :word-chars "-_?!*<>=+/:"
   :input-method "tex"
   :input-method-context limo-in-comment-p
   :vars '((tab-width . 8) (indent-tabs-mode . ())))
-(define-key limo-mode-map "C-c C-e" 'eval-last-sexp)
-(define-key limo-mode-map "C-c C-b" 'eval-buffer-limo)
-(defcommand eval-buffer-limo () "Evaluate the whole buffer as limo code."
-  (eval-string (buffer-string)) (message "Evaluated %s" (bf name)))
+(lisp-bind-source-keys limo-mode-map)

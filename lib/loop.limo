@@ -59,6 +59,7 @@
         (call-command cmd))
     (when (and (not (= tick0 (bf tick))) (not (member cmd '(set-mark-command yank)))) (deactivate-mark))
     (unless (eq cmd 'universal-argument) (unless *pending-prefix* (setf *prefix-arg* ())))
+    (setf *idle-done* ())
     (run-hook 'post-command-hook)
     (setf *last-command* *this-command*)))
 
@@ -149,4 +150,5 @@
 ;; electric-indent, electric-pair and show-paren are on by default, like in Emacs.
 ;; line numbers, hl-line are off until asked for.
 (setq *global-minors* '(electric-indent-mode electric-pair-mode show-paren-mode))
+(setf *global-minors* (cons 'limo-eldoc-mode *global-minors*))
 

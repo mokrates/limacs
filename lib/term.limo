@@ -109,8 +109,22 @@
 
 (defun term-raw-getch () ((nc-fn 'wgetch) *nc-scr*))
 
+(setq *idle-done* :t)
+(defun term-idle-work ()                   ; once per command, when no key is waiting: cheap-to-skip extras (eldoc)
+  (unless *idle-done*
+    (setf *idle-done* :t)
+    (let ((m *message*))
+      (run-hook 'idle-hook)
+      (unless (eq m *message*) (redraw)))))
+
 (defun term-wait-getch ()                  ; like term-raw-getch, but merges background syntax results while idle
-  (cond ((and *syntax-async* (> *syn-pending* 0))
+  (cond ((and (not *idle-done*) (dget *hooks* 'idle-hook))
+         ((nc-fn 'nodelay) *nc-scr* :t)
+         (let ((c (term-raw-getch)))
+           ((nc-fn 'nodelay) *nc-scr* ())
+           (when (< c 0) (term-idle-work))
+           (if (< c 0) (term-wait-getch) c)))
+        ((and *syntax-async* (> *syn-pending* 0))
          ((nc-fn 'nodelay) *nc-scr* :t)
          (let ((c (term-raw-getch)))
            (while (and (< c 0) (> *syn-pending* 0))

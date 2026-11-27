@@ -34,3 +34,8 @@
 ;; --- a custom colour theme: start from the dark one and change a few faces
 (define-theme 'my-theme '((keyword . "1;38;5;75") (comment . "3;38;5;102") (string . "38;5;150")))
 ;; (load-theme 'my-theme)     ; M-x load-theme offers it too
+
+;; --- REPL: use your own history file, and add a comma command to the REPL
+;; (setf *repl-history-file* "/tmp/my-repl-history")
+(repl-define-command "pwd" "print the default directory"
+  (lambda (arg) (repl-note (default-directory))))
